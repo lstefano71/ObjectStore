@@ -25,6 +25,7 @@ public sealed class ObjectEngine : IDisposable
     public ulong NextNodeId => _nextNodeId;
     public TransactionManager Transactions => _txn;
     internal SuperblockManager SuperblockManager => _sbManager;
+    internal BTree PrimaryTree => _tree;
     public bool IsReadOnly => _readOnly;
 
     private ObjectEngine(ContainerFile file, BuddyAllocator allocator, BTree tree,
@@ -189,7 +190,7 @@ public sealed class ObjectEngine : IDisposable
         };
 
         var key = new BTreeKey(record.ParentId, record.NameHash != 0 ? record.NameHash : id);
-        _tree.Insert(key, record.Serialize());
+        key = InsertWithCollisionHandling(key, record);
 
         // Insert into ID index: key=(0, id), value=serialized primary key
         var idKey = new BTreeKey(0, id);
@@ -454,7 +455,7 @@ public sealed class ObjectEngine : IDisposable
         };
 
         var key = new BTreeKey(record.ParentId, record.NameHash);
-        _tree.Insert(key, record.Serialize());
+        key = InsertWithCollisionHandling(key, record);
 
         // Insert into ID index
         _idTree.Insert(new BTreeKey(0, id), key.Serialize());
@@ -491,9 +492,9 @@ public sealed class ObjectEngine : IDisposable
         }
         record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        // Insert at new position
+        // Insert at new position (with collision handling)
         var newKey = new BTreeKey(record.ParentId, record.NameHash);
-        _tree.Insert(newKey, record.Serialize());
+        newKey = InsertWithCollisionHandling(newKey, record);
 
         // Update ID index to point to the new primary key
         _idTree.Update(new BTreeKey(0, nodeId), newKey.Serialize());
@@ -890,6 +891,36 @@ public sealed class ObjectEngine : IDisposable
         if (_txn.HasActiveTransaction)
             _txn.TrackNewBlock(addr, order);
         return addr;
+    }
+
+    /// <summary>
+    /// Inserts a record into the primary tree, handling hash collisions.
+    /// If the key already exists with a different name, uses a fallback key (parentId, nameHash ^ id).
+    /// Returns the actual key used (may differ from input if collision occurred).
+    /// </summary>
+    private BTreeKey InsertWithCollisionHandling(BTreeKey key, NodeRecord record)
+    {
+        try
+        {
+            _tree.Insert(key, record.Serialize());
+            return key;
+        }
+        catch (ObjectAlreadyExistsException)
+        {
+            // Check if it's a genuine duplicate (same name) or a hash collision
+            var existingData = _tree.Get(key);
+            if (existingData != null)
+            {
+                var existing = NodeRecord.Deserialize(existingData);
+                if (existing.Name == record.Name && existing.ParentId == record.ParentId)
+                    throw; // Genuine duplicate name under same parent
+            }
+
+            // Hash collision — use fallback key: (parentId, nameHash ^ id)
+            var fallbackKey = new BTreeKey(record.ParentId, record.NameHash ^ record.Id);
+            _tree.Insert(fallbackKey, record.Serialize());
+            return fallbackKey;
+        }
     }
 
     private (BTreeKey Key, NodeRecord? Record) FindById(ulong id)

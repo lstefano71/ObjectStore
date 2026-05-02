@@ -16,6 +16,11 @@ public static partial class NativeExports
                 return NativeErrorCodes.InvalidArg;
 
             string path = Marshal.PtrToStringUTF8((IntPtr)pathUtf8)!;
+            var opts = options != IntPtr.Zero ? HandleStore.Get<NativeOptions>(options) : null;
+
+            if (opts?.ReadOnly == true)
+                return NativeErrorCodes.InvalidArg; // Cannot create in read-only mode
+
             var engine = ObjectEngine.Create(path);
             *outHandle = HandleStore.Allocate(engine);
             NativeErrorHelper.ClearLastError();
@@ -36,7 +41,14 @@ public static partial class NativeExports
                 return NativeErrorCodes.InvalidArg;
 
             string path = Marshal.PtrToStringUTF8((IntPtr)pathUtf8)!;
-            var engine = ObjectEngine.Open(path);
+            var opts = options != IntPtr.Zero ? HandleStore.Get<NativeOptions>(options) : null;
+
+            ObjectEngine engine;
+            if (opts?.ReadOnly == true)
+                engine = ObjectEngine.OpenReadOnly(path);
+            else
+                engine = ObjectEngine.Open(path);
+
             *outHandle = HandleStore.Allocate(engine);
             NativeErrorHelper.ClearLastError();
             return NativeErrorCodes.Ok;
@@ -56,7 +68,20 @@ public static partial class NativeExports
                 return NativeErrorCodes.InvalidArg;
 
             string path = Marshal.PtrToStringUTF8((IntPtr)pathUtf8)!;
-            var engine = ObjectEngine.OpenOrCreate(path);
+            var opts = options != IntPtr.Zero ? HandleStore.Get<NativeOptions>(options) : null;
+
+            ObjectEngine engine;
+            if (opts?.ReadOnly == true)
+            {
+                if (!System.IO.File.Exists(path))
+                    return NativeErrorCodes.InvalidArg; // Cannot create in read-only mode
+                engine = ObjectEngine.OpenReadOnly(path);
+            }
+            else
+            {
+                engine = ObjectEngine.OpenOrCreate(path);
+            }
+
             *outHandle = HandleStore.Allocate(engine);
             NativeErrorHelper.ClearLastError();
             return NativeErrorCodes.Ok;

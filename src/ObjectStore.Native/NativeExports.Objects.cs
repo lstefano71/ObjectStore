@@ -100,7 +100,12 @@ public static partial class NativeExports
             var info = engine.GetInfo(objectId);
             if (info == null) return NativeErrorCodes.NotFound;
 
-            if (offset >= info.Size)
+            if (offset > info.Size)
+            {
+                // Gap write — not allowed
+                return NativeErrorCodes.InvalidArg;
+            }
+            else if (offset == info.Size)
             {
                 // Append at end
                 engine.Append(objectId, span);
