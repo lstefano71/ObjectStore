@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This report analyzes the feasibility of reimplementing ObjectStore's complete feature set using SQLite as the storage backend. The conclusion is that SQLite can implement **all** of ObjectStore's features with significantly less code, better small-record performance, and mature tooling — at the cost of large-blob read performance and some loss of control over crash-recovery semantics.
+This report analyzes the feasibility of reimplementing ObjectStore's complete feature set using SQLite as the storage backend. SQLite can implement **most** of ObjectStore's features with significantly less code, better small-record performance, and mature tooling — at the cost of large-blob read/append performance, per-block data integrity verification, true single-file deployment, and an additional native dependency. Several PRD requirements (per-block checksums, no external dependencies, efficient large-object append) present fundamental architectural mismatches that application-layer workarounds cannot fully resolve.
 
 ---
 
@@ -27,7 +27,14 @@ This report analyzes the feasibility of reimplementing ObjectStore's complete fe
 | WriteAt(id, offset, data) | Blob I/O API (`sqlite3_blob_write`) | Low |
 | Truncate(id, newLen) | `UPDATE SET data = substr(data, 1, newLen)` | Low |
 
-**Note:** SQLite's Blob I/O API (`sqlite3_blob_open/read/write/close`) provides random-access byte-level I/O without reading the entire blob — ideal for large objects.
+**Note:** SQLite's Blob I/O API (`sqlite3_blob_open/read/write/close`) provides random-access byte-level I/O without reading the entire blob — ideal for large object *reads* and in-place *writes that don't change size*.
+
+**⚠️ Critical limitation:** The Blob I/O API **cannot resize** blobs. `sqlite3_blob_write` fails if writing past the end. This means:
+- **Append** requires `data || ?` which reads the entire existing blob, concatenates, and rewrites it. For a 100MB object + 256B append, SQLite must read, copy, and rewrite all 100MB.
+- **Truncate** requires `substr(data, 1, newLen)` which similarly rewrites the blob.
+- ObjectStore, by contrast, only allocates a new extent block for append — the existing data is never copied.
+
+This makes SQLite fundamentally unsuitable for append-heavy workloads on large objects (a core use case in the PRD).
 
 ### 1.3 Transactions & Savepoints
 
@@ -80,6 +87,8 @@ Options:
 
 Per-block encryption is harder; SQLite encrypts at the page level. Application-layer encryption gives per-object granularity.
 
+**⚠️ Critical interaction:** Application-layer encryption is **mutually exclusive** with the Blob I/O API. Once a blob is encrypted as a whole (e.g., AES-256-GCM with per-object nonce), `sqlite3_blob_read` at an arbitrary offset returns ciphertext that cannot be independently decrypted. Every partial read becomes a full-blob read + full decrypt. ObjectStore's per-block encryption model allows reading and decrypting individual blocks independently — a 10-byte read from a 100MB encrypted object touches only one block.
+
 ### 1.8 Multi-Process Concurrency
 
 | ObjectStore Feature | SQLite Implementation | Complexity |
@@ -87,9 +96,11 @@ Per-block encryption is harder; SQLite encrypts at the page level. Application-l
 | File-level write lock | SQLite WAL handles this natively | None (built-in) |
 | Reader doesn't block writer | WAL mode: readers see snapshot, writer doesn't block | Built-in |
 | Lock timeout | `sqlite3_busy_timeout(ms)` | Trivial |
-| Refresh (see latest committed) | Close and reopen connection, or use `PRAGMA wal_checkpoint` | Low |
+| Refresh (see latest committed) | End and restart the read transaction | Low |
 
-SQLite's WAL mode provides MVCC semantics superior to ObjectStore's manual file locking.
+SQLite's WAL mode provides MVCC semantics similar to ObjectStore's manual file locking.
+
+**Note on snapshot control:** ObjectStore's `Refresh()` advances a reader's visible snapshot without releasing resources. In SQLite, a reader's snapshot is bound to the start of its transaction. To see newly committed data, the reader must `COMMIT` (or `ROLLBACK`) its current transaction and `BEGIN` a new one. `PRAGMA wal_checkpoint` is a **maintenance** operation (copies WAL pages back to the main database) — it does **not** advance any reader's snapshot visibility.
 
 ### 1.9 Crash Recovery
 
@@ -98,16 +109,23 @@ SQLite's WAL mode provides MVCC semantics superior to ObjectStore's manual file 
 | Dual superblock (atomic commit) | SQLite WAL (atomic commit built-in) | None |
 | Recovery from dirty close | `PRAGMA integrity_check` + automatic WAL replay | Built-in |
 | Allocator rebuild | Not needed (SQLite manages space internally) | N/A |
+| Per-block xxHash3 checksum | **No equivalent** — see §5.6 | N/A |
 
-SQLite's crash recovery is battle-tested across billions of deployments. It's arguably more robust than a custom implementation.
+SQLite's crash recovery is battle-tested across billions of deployments. However, SQLite does **not** provide per-page data integrity checksums by default (see Section 5.6 for implications).
 
 ### 1.10 Maintenance
 
 | ObjectStore Feature | SQLite Implementation | Complexity |
 |--------------------|-----------------------|:----------:|
-| Defragmentation | `VACUUM` | Built-in |
+| Defragmentation | `VACUUM` (with caveats — see below) | Built-in |
 | Statistics | `SELECT count(*), sum(length(data))` | Trivial |
 | File size | OS stat or `PRAGMA page_count * PRAGMA page_size` | Trivial |
+
+**⚠️ VACUUM limitations:** SQLite's `VACUUM` requires **2× the database file size** in temporary disk space (it rebuilds the entire database into a new file). It also requires an **exclusive lock** for its entire duration — no concurrent readers or writers. For a 10GB database, this means 10GB of free space and potentially minutes of downtime.
+
+ObjectStore's `Defragmenter` works incrementally within normal transactions (object-by-object), requires no extra disk space, and allows concurrent readers. `VACUUM INTO` can write to a new file without an exclusive lock, but produces a separate file rather than reclaiming space in-place.
+
+`auto_vacuum` mode avoids full VACUUM but only reclaims pages freed by DELETE — it does not defragment or compact existing data.
 
 ### 1.11 C ABI / NativeAOT
 
@@ -171,15 +189,32 @@ VALUES (1, NULL, '/', 2, X'', 0, 0, 0);
 | Aspect | Advantage |
 |--------|-----------|
 | Large blob reads (64KB+) | 2.5× faster (contiguous blocks vs overflow page reassembly) |
+| Large blob append | O(1) new block vs O(n) full rewrite in SQLite |
 | Large blob batch writes | 1.04× faster (when I/O dominates) |
-| Single-file simplicity | One file, no WAL/SHM auxiliaries |
+| Single-file simplicity | One file, no WAL/SHM auxiliaries (no auxiliary file loss risk) |
+| Per-block checksums | xxHash3 on every block detects bit-rot; SQLite has none by default |
+| Per-block encryption | Read/decrypt individual blocks; SQLite app-layer encryption requires full-blob decrypt |
 | Snapshot isolation control | Explicit refresh vs SQLite's "begin reads a snapshot" |
+| Incremental defragmentation | Object-by-object, no 2× disk space or exclusive lock |
+| Zero external dependencies | Pure .NET BCL (NFR-10 compliant) |
 
 ### Where They're Equal
 
-- Crash safety guarantees (both offer atomic commits)
 - Large blob batch writes on HDD (I/O bound dominates both)
 - Multi-process read throughput under contention
+- Transaction semantics (ACID guarantees)
+
+### Key Architectural Mismatches
+
+These are **fundamental** differences that cannot be bridged by application-layer workarounds:
+
+| Feature | ObjectStore | SQLite | Workaround? |
+|---------|-------------|--------|:-----------:|
+| Append to large blob | O(1) — new extent block | O(n) — full blob rewrite | ❌ None |
+| Per-block checksum on read | Built-in (xxHash3) | Not available by default | ⚠️ Partial (app-layer) |
+| Encrypted partial read | Decrypt one block | Decrypt entire blob | ❌ None |
+| Single-file atomicity | Dual superblock | WAL file loss = data loss | ⚠️ DELETE mode (loses concurrency) |
+| No native dependency | Pure .NET | Requires sqlite3 native lib | ❌ None |
 
 ---
 
@@ -209,22 +244,56 @@ SQLite stores blobs across 4KB overflow pages. For a 64KB object, that's 16 page
 ### 5.2 True Single-File Deployment
 SQLite in WAL mode creates `-wal` and `-shm` auxiliary files. In DELETE journal mode (single file), concurrent readers block the writer.
 
-**Mitigation:** Accept WAL mode (3 files) or use DELETE mode with reduced concurrency.
+**⚠️ Data loss risk:** The WAL file contains **committed-but-uncheckpointed transactions**. If the WAL file is lost (manual deletion, partial backup that captures `.db` but not `-wal`, filesystem snapshot of only the main file), those committed transactions are permanently lost. This is not a theoretical risk — it is a documented source of SQLite data loss in production deployments where backup tools or file management don't account for the auxiliary files.
+
+ObjectStore's dual-superblock model stores all committed data in a single file with atomic pointer-swap semantics. There are no auxiliary files whose loss could cause committed data to disappear.
+
+**Mitigation:** Use DELETE journal mode (accepts reduced concurrency), or enforce strict operational discipline around WAL file handling in backups and file management.
 
 ### 5.3 Custom Block-Level Encryption
 ObjectStore encrypts individual blocks with AES-256-GCM. SQLite encryption (SQLCipher) encrypts at the page level — you can't have per-object encryption keys.
 
-**Mitigation:** Application-layer encryption per object (encrypt blob before storage). This is actually how most real systems work.
+**Mitigation:** Application-layer encryption per object (encrypt blob before storage).
+
+**⚠️ However:** Application-layer encryption is mutually exclusive with the Blob I/O API (see §1.7). If encryption is enabled, every read — regardless of requested offset or length — must read and decrypt the entire blob. For a 100MB encrypted object where the caller wants 256 bytes at offset 50MB, SQLite must read all 100MB and decrypt it. ObjectStore reads and decrypts a single block.
 
 ### 5.4 Explicit MVCC Refresh Control
-ObjectStore's `Refresh()` lets readers choose when to see new commits. SQLite snapshots are bound to transaction start.
+ObjectStore's `Refresh()` lets readers choose when to see new commits without releasing any held resources. SQLite snapshots are bound to transaction start.
 
-**Mitigation:** Use `BEGIN`/`COMMIT` to control when the snapshot advances, or `PRAGMA wal_checkpoint` to force visibility.
+**Mitigation:** End the current read transaction and begin a new one. This is functionally equivalent but has different semantics — any cursors, blob handles, or prepared statements from the previous transaction are invalidated.
 
 ### 5.5 Predictable Allocation Patterns
 The buddy allocator gives deterministic block placement. SQLite's internal allocator is opaque.
 
 **Mitigation:** Not typically needed for application-level concerns.
+
+### 5.6 Per-Block Data Integrity Checksums
+ObjectStore computes an xxHash3 checksum for every block on write and verifies it on every read (PRD NFR-02). This detects:
+- Silent bit-rot (storage media degradation)
+- Partial/torn writes that passed OS-level fsync
+- File corruption from external processes or copy errors
+
+SQLite has **no per-page checksums** by default. `PRAGMA integrity_check` validates structural consistency (B-tree pointers, freelist) but does not detect corrupted page *content*. If a page's data bytes flip due to bit-rot, SQLite will happily return the corrupted data with no error.
+
+The `SQLITE_DBCONFIG_ENABLE_CHECKSUM` extension (available since 3.34.0) adds per-page checksums but is:
+- Not enabled by default
+- Incompatible with some SQLite tools that don't understand the checksum format
+- A compile-time option (not universally available in prebuilt binaries)
+
+**Impact:** For safety-critical stores where data integrity must be verified on every access, this is a significant gap. Application-layer checksums could be added (store hash alongside blob), but this adds complexity and doesn't protect against corruption of the hash itself.
+
+### 5.7 External Dependency (NFR-10 Violation)
+The PRD Non-Functional Requirement NFR-10 specifies: *"No external dependencies beyond .NET BCL."*
+
+SQLite introduces a **native unmanaged dependency** (sqlite3.dll / libsqlite3.so). This:
+- Complicates NativeAOT single-binary deployment (must ship the native library alongside)
+- Introduces platform-specific build matrix concerns (x64, ARM64, Linux, macOS, Windows)
+- Requires tracking SQLite upstream security patches independently
+- May conflict with other SQLite instances loaded in the same process (version skew)
+
+Using `Microsoft.Data.Sqlite` (the .NET wrapper) partially mitigates distribution but still bundles native `e_sqlite3.dll` — it is not a pure managed dependency.
+
+**Impact:** This is a hard violation of NFR-10 that cannot be worked around without changing the requirement.
 
 ---
 
@@ -280,25 +349,33 @@ This gives:
 |----------|---------------|
 | Maximum small-record throughput | → Use pure SQLite backend |
 | Maximum large-blob throughput | → Keep current ObjectStore |
+| Append-heavy workload on large objects | → Keep current ObjectStore (SQLite is O(n) per append) |
 | Minimum code complexity | → Use pure SQLite backend |
-| Best crash safety confidence | → Use pure SQLite backend |
+| Per-block data integrity verification | → Keep current ObjectStore |
 | Single-file deployment required | → Keep current ObjectStore |
-| Need per-object encryption | → Application-layer encryption with either |
-| Best overall balance | → **Hybrid approach** |
+| Need per-object encryption + partial reads | → Keep current ObjectStore |
+| No external dependencies (NFR-10) | → Keep current ObjectStore |
+| Best overall balance | → **Hybrid approach** (but adds complexity and a dependency) |
 
 ---
 
 ## 9. Conclusion
 
-Reimplementing ObjectStore's full feature set with SQLite as a backend is **fully feasible** and would require approximately 500-800 lines of C# wrapper code (vs ~3,500 lines of custom engine code). The result would be:
+Reimplementing ObjectStore's feature set with SQLite as a backend is **partially feasible** with significant caveats. The wrapper would require approximately 500-800 lines of C# code (vs ~3,500 lines of custom engine), but several PRD requirements create fundamental architectural mismatches:
 
+**What SQLite does well:**
 - **Faster** for small records and transaction batches (3-8×)
-- **Slower** for large blob sequential reads (2.5×)
-- **More reliable** (leveraging SQLite's exhaustive testing)
-- **More maintainable** (no custom B-tree, allocator, or crash recovery)
-- **More capable** (SQL queries, FTS, JSON, backup API for free)
+- **Less code** to maintain (no custom B-tree, allocator, or crash recovery)
+- **Rich ecosystem** (SQL queries, FTS, JSON, backup API, extensive tooling)
 
-The current ObjectStore's main advantage is contiguous block storage for large blobs. If large-blob read performance is critical, either keep the current engine or adopt the hybrid approach outlined in Section 7.
+**What SQLite cannot provide:**
+- **Per-block data integrity checksums** (PRD NFR-02) — no detection of silent corruption
+- **Efficient append to large objects** — O(n) full rewrite vs O(1) new block
+- **Per-block encryption with partial reads** — app-layer encryption requires full-blob decrypt
+- **Zero external dependencies** (PRD NFR-10) — sqlite3 is a native dependency
+- **Single-file atomicity** — WAL file loss causes committed data loss
+
+**Bottom line:** For workloads dominated by small records with simple CRUD operations, SQLite is clearly superior in both performance and simplicity. However, for the PRD's specified requirements — particularly large-object append, per-block integrity checksums, per-block encryption, and zero external dependencies — ObjectStore's custom architecture provides capabilities that SQLite cannot replicate at any complexity level. The hybrid approach (Section 7) could combine strengths but introduces additional complexity and still violates NFR-10.
 
 ---
 
