@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ObjectStore.Native/ObjectStore.Native.csproj" />
+    <Project Path="src/ObjectStore/ObjectStore.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ObjectStore.Tests/ObjectStore.Tests.csproj" />
+  </Folder>
+</Solution>
