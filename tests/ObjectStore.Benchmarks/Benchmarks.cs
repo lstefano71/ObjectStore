@@ -19,7 +19,8 @@ public class SingleOperationBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _path = Path.Combine(Path.GetTempPath(), $"bench_{Guid.NewGuid():N}.dat");
+        var tmpDir = Environment.GetEnvironmentVariable("BENCH_TMPDIR") ?? Path.GetTempPath();
+        _path = Path.Combine(tmpDir, $"bench_{Guid.NewGuid():N}.dat");
         _engine = ObjectEngine.Create(_path);
         _smallData = new byte[100];
         _largeData = new byte[65536];
@@ -103,7 +104,8 @@ public class TransactionBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _path = Path.Combine(Path.GetTempPath(), $"bench_txn_{Guid.NewGuid():N}.dat");
+        var tmpDir = Environment.GetEnvironmentVariable("BENCH_TMPDIR") ?? Path.GetTempPath();
+        _path = Path.Combine(tmpDir, $"bench_txn_{Guid.NewGuid():N}.dat");
         _engine = ObjectEngine.Create(_path);
     }
 
@@ -140,7 +142,8 @@ public class MixedWorkloadBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _path = Path.Combine(Path.GetTempPath(), $"bench_mixed_{Guid.NewGuid():N}.dat");
+        var tmpDir = Environment.GetEnvironmentVariable("BENCH_TMPDIR") ?? Path.GetTempPath();
+        _path = Path.Combine(tmpDir, $"bench_mixed_{Guid.NewGuid():N}.dat");
         _engine = ObjectEngine.Create(_path);
         _data = new byte[256];
         _readBuf = new byte[256];

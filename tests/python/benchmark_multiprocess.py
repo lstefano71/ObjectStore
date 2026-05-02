@@ -100,8 +100,9 @@ class BenchmarkResult:
         return "\n".join(parts)
 
 
-def temp_db_path():
-    return os.path.join(tempfile.gettempdir(), f"bench_{os.getpid()}_{time.time_ns()}.dat")
+def temp_db_path(tmpdir=None):
+    base = tmpdir or tempfile.gettempdir()
+    return os.path.join(base, f"bench_{os.getpid()}_{time.time_ns()}.dat")
 
 
 # ─── Worker process entry point (for multiprocessing) ─────────────────────────
@@ -210,9 +211,9 @@ def worker_mixed(lib_path, db_path, worker_id, obj_ids, ops_count, write_ratio, 
 
 # ─── Single-process benchmarks ────────────────────────────────────────────────
 
-def bench_sequential_write(lib_path, count, data_size):
+def bench_sequential_write(lib_path, count, data_size, tmpdir=None):
     """Single-process sequential write benchmark."""
-    db_path = temp_db_path()
+    db_path = temp_db_path(tmpdir)
     lib = load_lib(lib_path)
     create_db(lib, db_path)
     handle = open_db(lib, db_path)
@@ -236,9 +237,9 @@ def bench_sequential_write(lib_path, count, data_size):
     )
 
 
-def bench_sequential_read(lib_path, count, data_size):
+def bench_sequential_read(lib_path, count, data_size, tmpdir=None):
     """Single-process sequential read benchmark (pre-populated DB)."""
-    db_path = temp_db_path()
+    db_path = temp_db_path(tmpdir)
     lib = load_lib(lib_path)
     create_db(lib, db_path)
     handle = open_db(lib, db_path)
@@ -274,9 +275,9 @@ def bench_sequential_read(lib_path, count, data_size):
     )
 
 
-def bench_transaction_batch(lib_path, batch_size, data_size):
+def bench_transaction_batch(lib_path, batch_size, data_size, tmpdir=None):
     """Single-process: create N objects in one transaction."""
-    db_path = temp_db_path()
+    db_path = temp_db_path(tmpdir)
     lib = load_lib(lib_path)
     create_db(lib, db_path)
     handle = open_db(lib, db_path)
@@ -304,9 +305,9 @@ def bench_transaction_batch(lib_path, batch_size, data_size):
 
 # ─── Multi-process benchmarks ─────────────────────────────────────────────────
 
-def bench_concurrent_write(lib_path, num_workers, objects_per_worker, data_size):
+def bench_concurrent_write(lib_path, num_workers, objects_per_worker, data_size, tmpdir=None):
     """Multi-process concurrent write benchmark."""
-    db_path = temp_db_path()
+    db_path = temp_db_path(tmpdir)
     lib = load_lib(lib_path)
     create_db(lib, db_path)
     close_db(lib, open_db(lib, db_path))  # ensure file exists properly
@@ -329,9 +330,9 @@ def bench_concurrent_write(lib_path, num_workers, objects_per_worker, data_size)
     )
 
 
-def bench_concurrent_read(lib_path, num_readers, objects_count, data_size, iterations):
+def bench_concurrent_read(lib_path, num_readers, objects_count, data_size, iterations, tmpdir=None):
     """Multi-process concurrent read benchmark."""
-    db_path = temp_db_path()
+    db_path = temp_db_path(tmpdir)
     lib = load_lib(lib_path)
     create_db(lib, db_path)
     handle = open_db(lib, db_path)
@@ -366,9 +367,9 @@ def bench_concurrent_read(lib_path, num_readers, objects_count, data_size, itera
     )
 
 
-def bench_mixed_workload(lib_path, num_workers, ops_per_worker, write_ratio, data_size):
+def bench_mixed_workload(lib_path, num_workers, ops_per_worker, write_ratio, data_size, tmpdir=None):
     """Multi-process mixed read/write benchmark."""
-    db_path = temp_db_path()
+    db_path = temp_db_path(tmpdir)
     lib = load_lib(lib_path)
     create_db(lib, db_path)
     handle = open_db(lib, db_path)
@@ -406,7 +407,7 @@ def bench_mixed_workload(lib_path, num_workers, ops_per_worker, write_ratio, dat
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def run_benchmarks(lib_path, quick=False):
+def run_benchmarks(lib_path, quick=False, tmpdir=None):
     """Run all benchmarks and print results."""
     results = []
 
@@ -420,11 +421,13 @@ def run_benchmarks(lib_path, quick=False):
         multi_count = 200
         read_iters = 10
 
+    effective_tmpdir = tmpdir or tempfile.gettempdir()
     print("=" * 70)
     print("  ObjectStore Benchmarks")
     print("=" * 70)
     print(f"  Mode: {'Quick' if quick else 'Full'}")
     print(f"  Library: {lib_path}")
+    print(f"  Temp dir: {effective_tmpdir}")
     print(f"  CPU cores: {multiprocessing.cpu_count()}")
     print()
 
@@ -432,19 +435,19 @@ def run_benchmarks(lib_path, quick=False):
     print("─── Single-Process Benchmarks ───")
     print()
 
-    r = bench_sequential_write(lib_path, single_count, 256)
+    r = bench_sequential_write(lib_path, single_count, 256, tmpdir)
     results.append(r); print(r); print()
 
-    r = bench_sequential_write(lib_path, single_count // 4, 65536)
+    r = bench_sequential_write(lib_path, single_count // 4, 65536, tmpdir)
     results.append(r); print(r); print()
 
-    r = bench_sequential_read(lib_path, single_count, 256)
+    r = bench_sequential_read(lib_path, single_count, 256, tmpdir)
     results.append(r); print(r); print()
 
-    r = bench_sequential_read(lib_path, single_count // 4, 65536)
+    r = bench_sequential_read(lib_path, single_count // 4, 65536, tmpdir)
     results.append(r); print(r); print()
 
-    r = bench_transaction_batch(lib_path, single_count, 256)
+    r = bench_transaction_batch(lib_path, single_count, 256, tmpdir)
     results.append(r); print(r); print()
 
     # ─── Multi-process write scaling ───
@@ -453,7 +456,7 @@ def run_benchmarks(lib_path, quick=False):
 
     baseline_ops = None
     for n_workers in [1, 2, 4, 8]:
-        r = bench_concurrent_write(lib_path, n_workers, multi_count, 256)
+        r = bench_concurrent_write(lib_path, n_workers, multi_count, 256, tmpdir)
         results.append(r)
         if baseline_ops is None:
             baseline_ops = r.ops_per_sec
@@ -468,7 +471,7 @@ def run_benchmarks(lib_path, quick=False):
 
     baseline_ops = None
     for n_readers in [1, 2, 4, 8]:
-        r = bench_concurrent_read(lib_path, n_readers, 200, 256, read_iters)
+        r = bench_concurrent_read(lib_path, n_readers, 200, 256, read_iters, tmpdir)
         results.append(r)
         if baseline_ops is None:
             baseline_ops = r.ops_per_sec
@@ -481,23 +484,23 @@ def run_benchmarks(lib_path, quick=False):
     print("─── Multi-Process Mixed Workload ───")
     print()
 
-    r = bench_mixed_workload(lib_path, 4, multi_count, 0.2, 256)
+    r = bench_mixed_workload(lib_path, 4, multi_count, 0.2, 256, tmpdir)
     results.append(r); print(r); print()
 
-    r = bench_mixed_workload(lib_path, 4, multi_count, 0.5, 256)
+    r = bench_mixed_workload(lib_path, 4, multi_count, 0.5, 256, tmpdir)
     results.append(r); print(r); print()
 
-    r = bench_mixed_workload(lib_path, 8, multi_count, 0.2, 256)
+    r = bench_mixed_workload(lib_path, 8, multi_count, 0.2, 256, tmpdir)
     results.append(r); print(r); print()
 
     # ─── Large object throughput ───
     print("─── Large Object Throughput ───")
     print()
 
-    r = bench_sequential_write(lib_path, 50 if quick else 200, 1048576)
+    r = bench_sequential_write(lib_path, 50 if quick else 200, 1048576, tmpdir)
     results.append(r); print(r); print()
 
-    r = bench_sequential_read(lib_path, 50 if quick else 200, 1048576)
+    r = bench_sequential_read(lib_path, 50 if quick else 200, 1048576, tmpdir)
     results.append(r); print(r); print()
 
     # ─── Summary table ───
@@ -520,7 +523,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ObjectStore multi-process benchmarks")
     parser.add_argument("--lib", type=str, help="Path to native library DLL")
     parser.add_argument("--quick", action="store_true", help="Run with reduced iterations")
+    parser.add_argument("--tmpdir", type=str, help="Directory for temp DB files (controls target disk)")
     args = parser.parse_args()
 
     lib_path = args.lib or find_native_lib()
-    run_benchmarks(lib_path, quick=args.quick)
+    run_benchmarks(lib_path, quick=args.quick, tmpdir=args.tmpdir)
