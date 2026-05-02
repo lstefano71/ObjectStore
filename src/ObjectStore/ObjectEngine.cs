@@ -304,33 +304,30 @@ public sealed class ObjectEngine : IDisposable
 
         var extents = LoadExtentList(record);
         long currentOffset = 0;
-        int dataOffset = 0;
-        int remaining = data.Length;
+        long writeEnd = offset + data.Length;
 
-        for (int i = 0; i < extents.Extents.Count && remaining > 0; i++)
+        for (int i = 0; i < extents.Extents.Count && currentOffset < writeEnd; i++)
         {
             var (addr, order) = extents.Extents[i];
             int capacity = FormatConstants.PayloadSizeForOrder(order);
             long extentEnd = currentOffset + capacity;
 
-            if (offset < extentEnd && currentOffset < offset + data.Length)
+            if (offset < extentEnd && currentOffset < writeEnd)
             {
                 int skipInExtent = (int)Math.Max(0, offset - currentOffset);
-                int startInData = (int)Math.Max(0, currentOffset - offset);
-                int toWrite = Math.Min(capacity - skipInExtent, remaining - startInData + dataOffset);
-                toWrite = Math.Min(toWrite, data.Length - startInData);
+                int srcStart = (int)Math.Max(0, currentOffset - offset);
+                int toWrite = Math.Min(capacity - skipInExtent, data.Length - srcStart);
 
                 if (toWrite > 0)
                 {
                     // COW: read old block, modify, write to new block
                     byte[] blockData = _file.ReadBlock(addr, order);
-                    data.Slice(startInData, toWrite).CopyTo(blockData.AsSpan(skipInExtent));
+                    data.Slice(srcStart, toWrite).CopyTo(blockData.AsSpan(skipInExtent));
 
                     long newAddr = _allocator.Allocate(order);
                     _file.WriteBlock(newAddr, order, blockData);
                     DeferredFree(addr, order);
                     extents.Extents[i] = (newAddr, order);
-                    remaining -= toWrite;
                 }
             }
 

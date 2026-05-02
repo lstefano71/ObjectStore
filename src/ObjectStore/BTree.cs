@@ -17,7 +17,7 @@ public sealed class BTree
     public int Order => _order;
 
     private const int DefaultOrder = 32;
-    private const int DefaultNodeBlockOrder = 6; // 4KB
+    private const int DefaultNodeBlockOrder = 8; // 16KB — holds ~147 entries, well above split threshold of 63
 
     public BTree(BuddyAllocator allocator, ContainerFile file,
                  long rootAddress = 0, int order = DefaultOrder, int nodeBlockOrder = DefaultNodeBlockOrder)
