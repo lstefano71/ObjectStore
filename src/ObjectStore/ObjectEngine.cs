@@ -204,53 +204,69 @@ public sealed class ObjectEngine : IDisposable
     public ulong CreateObject(string? name = null, byte compressionCodec = 0)
     {
         ThrowIfReadOnly();
-        ulong id = _nextNodeId++;
-        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-        var record = new NodeRecord
+        try
         {
-            Id = id,
-            ParentId = 1, // Under root by default
-            NameHash = name != null ? FnvHash.ComputeString(name) : 0,
-            Name = name ?? string.Empty,
-            NodeTypeFlags = NodeRecord.FlagHasData,
-            Size = 0,
-            Created = now,
-            Modified = now,
-            CompressionCodec = compressionCodec,
-        };
+            ulong id = _nextNodeId++;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        var key = new BTreeKey(record.ParentId, record.NameHash != 0 ? record.NameHash : id);
-        key = InsertWithCollisionHandling(key, record);
+            var record = new NodeRecord
+            {
+                Id = id,
+                ParentId = 1, // Under root by default
+                NameHash = name != null ? FnvHash.ComputeString(name) : 0,
+                Name = name ?? string.Empty,
+                NodeTypeFlags = NodeRecord.FlagHasData,
+                Size = 0,
+                Created = now,
+                Modified = now,
+                CompressionCodec = compressionCodec,
+            };
 
-        // Insert into ID index: key=(0, id), value=serialized primary key
-        var idKey = new BTreeKey(0, id);
-        _idTree.Insert(idKey, key.Serialize());
+            var key = new BTreeKey(record.ParentId, record.NameHash != 0 ? record.NameHash : id);
+            key = InsertWithCollisionHandling(key, record);
 
-        AutoCommit();
-        return id;
+            // Insert into ID index: key=(0, id), value=serialized primary key
+            var idKey = new BTreeKey(0, id);
+            _idTree.Insert(idKey, key.Serialize());
+
+            AutoCommit();
+            return id;
+        }
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     /// <summary>Deletes an object by ID.</summary>
     public bool DeleteObject(ulong id)
     {
         ThrowIfReadOnly();
-        var (key, record) = FindById(id);
-        if (record == null) return false;
-
-        // Free extent data
-        if (record.ExtentListAddress != 0)
+        try
         {
-            var extents = LoadExtentList(record);
-            foreach (var (addr, order) in extents.Extents)
-                DeferredFree(addr, order);
-            DeferredFreeExtentListBlock(record.ExtentListAddress);
-        }
+            var (key, record) = FindById(id);
+            if (record == null) return false;
 
-        _tree.Delete(key);
-        _idTree.Delete(new BTreeKey(0, id));
-        AutoCommit();
-        return true;
+            // Free extent data
+            if (record.ExtentListAddress != 0)
+            {
+                var extents = LoadExtentList(record);
+                foreach (var (addr, order) in extents.Extents)
+                    DeferredFree(addr, order);
+                DeferredFreeExtentListBlock(record.ExtentListAddress);
+            }
+
+            _tree.Delete(key);
+            _idTree.Delete(new BTreeKey(0, id));
+            AutoCommit();
+            return true;
+        }
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     /// <summary>Checks if an object exists by ID.</summary>
@@ -271,67 +287,75 @@ public sealed class ObjectEngine : IDisposable
     public void Append(ulong id, ReadOnlySpan<byte> data)
     {
         ThrowIfReadOnly();
-        var (key, record) = FindById(id);
-        if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
-
-        // Load or create extent list
-        var extents = LoadExtentList(record);
-
-        int remaining = data.Length;
-        int dataOffset = 0;
-
-        // Try to fill the last extent block first (COW it with appended data)
-        if (extents.Extents.Count > 0)
+        try
         {
-            int lastIdx = extents.Extents.Count - 1;
-            var (lastAddr, lastOrder) = extents.Extents[lastIdx];
-            int capacity = FormatConstants.PayloadSizeForOrder(lastOrder);
+            var (key, record) = FindById(id);
+            if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
 
-            // Calculate how much of the last block is used
-            long usedBefore = 0;
-            for (int i = 0; i < lastIdx; i++)
-                usedBefore += FormatConstants.PayloadSizeForOrder(extents.Extents[i].Order);
-            int lastBlockUsed = (int)(record.Size - usedBefore);
+            // Load or create extent list
+            var extents = LoadExtentList(record);
 
-            int spaceInLast = capacity - lastBlockUsed;
-            if (spaceInLast > 0)
+            int remaining = data.Length;
+            int dataOffset = 0;
+
+            // Try to fill the last extent block first (COW it with appended data)
+            if (extents.Extents.Count > 0)
             {
-                int toFill = Math.Min(remaining, spaceInLast);
-                byte[] blockData = _file.ReadBlock(lastAddr, lastOrder);
-                data.Slice(dataOffset, toFill).CopyTo(blockData.AsSpan(lastBlockUsed));
+                int lastIdx = extents.Extents.Count - 1;
+                var (lastAddr, lastOrder) = extents.Extents[lastIdx];
+                int capacity = FormatConstants.PayloadSizeForOrder(lastOrder);
 
-                // COW: allocate new block, write merged data, free old
-                long newAddr = AllocateTracked(lastOrder);
-                _file.WriteBlock(newAddr, lastOrder, blockData.AsSpan(0, lastBlockUsed + toFill));
-                DeferredFree(lastAddr, lastOrder);
-                extents.Extents[lastIdx] = (newAddr, lastOrder);
+                // Calculate how much of the last block is used
+                long usedBefore = 0;
+                for (int i = 0; i < lastIdx; i++)
+                    usedBefore += FormatConstants.PayloadSizeForOrder(extents.Extents[i].Order);
+                int lastBlockUsed = (int)(record.Size - usedBefore);
 
-                dataOffset += toFill;
-                remaining -= toFill;
+                int spaceInLast = capacity - lastBlockUsed;
+                if (spaceInLast > 0)
+                {
+                    int toFill = Math.Min(remaining, spaceInLast);
+                    byte[] blockData = _file.ReadBlock(lastAddr, lastOrder);
+                    data.Slice(dataOffset, toFill).CopyTo(blockData.AsSpan(lastBlockUsed));
+
+                    // COW: allocate new block, write merged data, free old
+                    long newAddr = AllocateTracked(lastOrder);
+                    _file.WriteBlock(newAddr, lastOrder, blockData.AsSpan(0, lastBlockUsed + toFill));
+                    DeferredFree(lastAddr, lastOrder);
+                    extents.Extents[lastIdx] = (newAddr, lastOrder);
+
+                    dataOffset += toFill;
+                    remaining -= toFill;
+                }
             }
-        }
 
-        // Allocate new blocks for remaining data
-        while (remaining > 0)
+            // Allocate new blocks for remaining data
+            while (remaining > 0)
+            {
+                int order = FormatConstants.OrderForPayload(Math.Min(remaining, FormatConstants.PayloadSizeForOrder(FormatConstants.OrderCount - 1)));
+                int capacity = FormatConstants.PayloadSizeForOrder(order);
+                int toWrite = Math.Min(remaining, capacity);
+
+                long blockAddr = AllocateTracked(order);            _file.WriteBlock(blockAddr, order, data.Slice(dataOffset, toWrite));
+                extents.Extents.Add((blockAddr, order));
+
+                dataOffset += toWrite;
+                remaining -= toWrite;
+            }
+
+            // Save extent list
+            record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
+            record.Size += data.Length;
+            record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            _tree.Update(key, record.Serialize());
+            AutoCommit();
+        }
+        finally
         {
-            int order = FormatConstants.OrderForPayload(Math.Min(remaining, FormatConstants.PayloadSizeForOrder(FormatConstants.OrderCount - 1)));
-            int capacity = FormatConstants.PayloadSizeForOrder(order);
-            int toWrite = Math.Min(remaining, capacity);
-
-            long blockAddr = AllocateTracked(order);            _file.WriteBlock(blockAddr, order, data.Slice(dataOffset, toWrite));
-            extents.Extents.Add((blockAddr, order));
-
-            dataOffset += toWrite;
-            remaining -= toWrite;
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
         }
-
-        // Save extent list
-        record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
-        record.Size += data.Length;
-        record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-        _tree.Update(key, record.Serialize());
-        AutoCommit();
     }
 
     /// <summary>Reads data from an object at the given offset.</summary>
@@ -378,77 +402,93 @@ public sealed class ObjectEngine : IDisposable
     public void WriteAt(ulong id, long offset, ReadOnlySpan<byte> data)
     {
         ThrowIfReadOnly();
-        var (key, record) = FindById(id);
-        if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
-        if (offset + data.Length > record.Size)
-            throw new ArgumentException("WriteAt cannot extend the object. Use Append instead.");
-
-        var extents = LoadExtentList(record);
-        long currentOffset = 0;
-        long writeEnd = offset + data.Length;
-
-        for (int i = 0; i < extents.Extents.Count && currentOffset < writeEnd; i++)
+        try
         {
-            var (addr, order) = extents.Extents[i];
-            int capacity = FormatConstants.PayloadSizeForOrder(order);
-            long extentEnd = currentOffset + capacity;
+            var (key, record) = FindById(id);
+            if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+            if (offset + data.Length > record.Size)
+                throw new ArgumentException("WriteAt cannot extend the object. Use Append instead.");
 
-            if (offset < extentEnd && currentOffset < writeEnd)
+            var extents = LoadExtentList(record);
+            long currentOffset = 0;
+            long writeEnd = offset + data.Length;
+
+            for (int i = 0; i < extents.Extents.Count && currentOffset < writeEnd; i++)
             {
-                int skipInExtent = (int)Math.Max(0, offset - currentOffset);
-                int srcStart = (int)Math.Max(0, currentOffset - offset);
-                int toWrite = Math.Min(capacity - skipInExtent, data.Length - srcStart);
+                var (addr, order) = extents.Extents[i];
+                int capacity = FormatConstants.PayloadSizeForOrder(order);
+                long extentEnd = currentOffset + capacity;
 
-                if (toWrite > 0)
+                if (offset < extentEnd && currentOffset < writeEnd)
                 {
-                    // COW: read old block, modify, write to new block
-                    byte[] blockData = _file.ReadBlock(addr, order);
-                    data.Slice(srcStart, toWrite).CopyTo(blockData.AsSpan(skipInExtent));
+                    int skipInExtent = (int)Math.Max(0, offset - currentOffset);
+                    int srcStart = (int)Math.Max(0, currentOffset - offset);
+                    int toWrite = Math.Min(capacity - skipInExtent, data.Length - srcStart);
 
-                    long newAddr = AllocateTracked(order);
-                    _file.WriteBlock(newAddr, order, blockData);
-                    DeferredFree(addr, order);
-                    extents.Extents[i] = (newAddr, order);
+                    if (toWrite > 0)
+                    {
+                        // COW: read old block, modify, write to new block
+                        byte[] blockData = _file.ReadBlock(addr, order);
+                        data.Slice(srcStart, toWrite).CopyTo(blockData.AsSpan(skipInExtent));
+
+                        long newAddr = AllocateTracked(order);
+                        _file.WriteBlock(newAddr, order, blockData);
+                        DeferredFree(addr, order);
+                        extents.Extents[i] = (newAddr, order);
+                    }
                 }
+
+                currentOffset += capacity;
             }
 
-            currentOffset += capacity;
+            record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
+            record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _tree.Update(key, record.Serialize());
+            AutoCommit();
         }
-
-        record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
-        record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        _tree.Update(key, record.Serialize());
-        AutoCommit();
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     /// <summary>Truncates an object to the specified length.</summary>
     public void Truncate(ulong id, long newLength)
     {
         ThrowIfReadOnly();
-        var (key, record) = FindById(id);
-        if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
-        if (newLength >= record.Size) return;
-
-        var extents = LoadExtentList(record);
-
-        for (int i = extents.Extents.Count - 1; i >= 0; i--)
+        try
         {
-            long extentStart = 0;
-            for (int j = 0; j < i; j++)
-                extentStart += FormatConstants.PayloadSizeForOrder(extents.Extents[j].Order);
+            var (key, record) = FindById(id);
+            if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+            if (newLength >= record.Size) return;
 
-            if (extentStart >= newLength)
+            var extents = LoadExtentList(record);
+
+            for (int i = extents.Extents.Count - 1; i >= 0; i--)
             {
-                DeferredFree(extents.Extents[i].Address, extents.Extents[i].Order);
-                extents.Extents.RemoveAt(i);
-            }
-        }
+                long extentStart = 0;
+                for (int j = 0; j < i; j++)
+                    extentStart += FormatConstants.PayloadSizeForOrder(extents.Extents[j].Order);
 
-        record.Size = newLength;
-        record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
-        record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        _tree.Update(key, record.Serialize());
-        AutoCommit();
+                if (extentStart >= newLength)
+                {
+                    DeferredFree(extents.Extents[i].Address, extents.Extents[i].Order);
+                    extents.Extents.RemoveAt(i);
+                }
+            }
+
+            record.Size = newLength;
+            record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
+            record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _tree.Update(key, record.Serialize());
+            AutoCommit();
+        }
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     /// <summary>Lists all objects.</summary>
@@ -467,107 +507,131 @@ public sealed class ObjectEngine : IDisposable
     public ulong CreateChild(ulong parentId, string name, bool isContainer = false)
     {
         ThrowIfReadOnly();
-        ulong id = _nextNodeId++;
-        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-        byte flags = NodeRecord.FlagHasData;
-        if (isContainer) flags = NodeRecord.FlagHasChildren;
-
-        var record = new NodeRecord
+        try
         {
-            Id = id,
-            ParentId = parentId,
-            NameHash = FnvHash.ComputeString(name),
-            Name = name,
-            NodeTypeFlags = flags,
-            Size = 0,
-            Created = now,
-            Modified = now,
-        };
+            ulong id = _nextNodeId++;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        var key = new BTreeKey(record.ParentId, record.NameHash);
-        key = InsertWithCollisionHandling(key, record);
+            byte flags = NodeRecord.FlagHasData;
+            if (isContainer) flags = NodeRecord.FlagHasChildren;
 
-        // Insert into ID index
-        _idTree.Insert(new BTreeKey(0, id), key.Serialize());
+            var record = new NodeRecord
+            {
+                Id = id,
+                ParentId = parentId,
+                NameHash = FnvHash.ComputeString(name),
+                Name = name,
+                NodeTypeFlags = flags,
+                Size = 0,
+                Created = now,
+                Modified = now,
+            };
 
-        // Update parent's child count
-        UpdateChildCount(parentId, 1);
+            var key = new BTreeKey(record.ParentId, record.NameHash);
+            key = InsertWithCollisionHandling(key, record);
 
-        AutoCommit();
-        return id;
+            // Insert into ID index
+            _idTree.Insert(new BTreeKey(0, id), key.Serialize());
+
+            // Update parent's child count
+            UpdateChildCount(parentId, 1);
+
+            AutoCommit();
+            return id;
+        }
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     /// <summary>Moves a node to a new parent (and optionally renames it).</summary>
     public void MoveNode(ulong nodeId, ulong newParentId, string? newName = null)
     {
         ThrowIfReadOnly();
-        var (oldKey, record) = FindById(nodeId);
-        if (record == null) throw new ObjectNotFoundException($"Node {nodeId} not found.");
-
-        // Cycle detection: ensure newParentId is not a descendant of nodeId
-        if (IsDescendantOf(newParentId, nodeId))
-            throw new InvalidOperationException("Cannot move a node into its own subtree.");
-
-        ulong oldParentId = record.ParentId;
-
-        // Remove from old position
-        _tree.Delete(oldKey);
-
-        // Update record
-        record.ParentId = newParentId;
-        if (newName != null)
+        try
         {
-            record.Name = newName;
-            record.NameHash = FnvHash.ComputeString(newName);
+            var (oldKey, record) = FindById(nodeId);
+            if (record == null) throw new ObjectNotFoundException($"Node {nodeId} not found.");
+
+            // Cycle detection: ensure newParentId is not a descendant of nodeId
+            if (IsDescendantOf(newParentId, nodeId))
+                throw new InvalidOperationException("Cannot move a node into its own subtree.");
+
+            ulong oldParentId = record.ParentId;
+
+            // Remove from old position
+            _tree.Delete(oldKey);
+
+            // Update record
+            record.ParentId = newParentId;
+            if (newName != null)
+            {
+                record.Name = newName;
+                record.NameHash = FnvHash.ComputeString(newName);
+            }
+            record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            // Insert at new position (with collision handling)
+            var newKey = new BTreeKey(record.ParentId, record.NameHash);
+            newKey = InsertWithCollisionHandling(newKey, record);
+
+            // Update ID index to point to the new primary key
+            _idTree.Update(new BTreeKey(0, nodeId), newKey.Serialize());
+
+            // Update child counts
+            UpdateChildCount(oldParentId, -1);
+            UpdateChildCount(newParentId, 1);
+
+            AutoCommit();
         }
-        record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-        // Insert at new position (with collision handling)
-        var newKey = new BTreeKey(record.ParentId, record.NameHash);
-        newKey = InsertWithCollisionHandling(newKey, record);
-
-        // Update ID index to point to the new primary key
-        _idTree.Update(new BTreeKey(0, nodeId), newKey.Serialize());
-
-        // Update child counts
-        UpdateChildCount(oldParentId, -1);
-        UpdateChildCount(newParentId, 1);
-
-        AutoCommit();
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     /// <summary>Recursively deletes a node and all its descendants.</summary>
     public void DeleteSubtree(ulong nodeId)
     {
         ThrowIfReadOnly();
-        // Recursively collect all descendants
-        var toDelete = new List<(BTreeKey Key, NodeRecord Record)>();
-        CollectSubtree(nodeId, toDelete);
-
-        // Also find the node itself
-        var (nodeKey, nodeRecord) = FindById(nodeId);
-        if (nodeRecord == null) throw new ObjectNotFoundException($"Node {nodeId} not found.");
-
-        ulong parentId = nodeRecord.ParentId;
-
-        // Delete all descendants first
-        foreach (var (key, rec) in toDelete)
+        try
         {
-            FreeNodeData(rec);
-            _tree.Delete(key);
-            _idTree.Delete(new BTreeKey(0, rec.Id));
+            // Recursively collect all descendants
+            var toDelete = new List<(BTreeKey Key, NodeRecord Record)>();
+            CollectSubtree(nodeId, toDelete);
+
+            // Also find the node itself
+            var (nodeKey, nodeRecord) = FindById(nodeId);
+            if (nodeRecord == null) throw new ObjectNotFoundException($"Node {nodeId} not found.");
+
+            ulong parentId = nodeRecord.ParentId;
+
+            // Delete all descendants first
+            foreach (var (key, rec) in toDelete)
+            {
+                FreeNodeData(rec);
+                _tree.Delete(key);
+                _idTree.Delete(new BTreeKey(0, rec.Id));
+            }
+
+            // Delete the node itself
+            FreeNodeData(nodeRecord);
+            _tree.Delete(nodeKey);
+            _idTree.Delete(new BTreeKey(0, nodeId));
+
+            // Update parent's child count
+            UpdateChildCount(parentId, -1);
+
+            AutoCommit();
         }
-
-        // Delete the node itself
-        FreeNodeData(nodeRecord);
-        _tree.Delete(nodeKey);
-        _idTree.Delete(new BTreeKey(0, nodeId));
-
-        // Update parent's child count
-        UpdateChildCount(parentId, -1);
-
-        AutoCommit();
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     /// <summary>Resolves a path to a node ID.</summary>
@@ -650,7 +714,15 @@ public sealed class ObjectEngine : IDisposable
     {
         ThrowIfReadOnly();
         AcquireWriteLockAndRefresh();
-        _txn.Begin();
+        try
+        {
+            _txn.Begin();
+        }
+        catch
+        {
+            ReleaseWriteLockIfHeld();
+            throw;
+        }
     }
 
     /// <summary>Commits the current transaction. Releases the write lock.</summary>
@@ -849,15 +921,23 @@ public sealed class ObjectEngine : IDisposable
     public void SetMetadata(ulong id, string key, string value)
     {
         ThrowIfReadOnly();
-        var (treeKey, record) = FindById(id);
-        if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+        try
+        {
+            var (treeKey, record) = FindById(id);
+            if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
 
-        var metadata = LoadMetadata(record);
-        metadata[key] = value;
-        record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
-        record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        _tree.Update(treeKey, record.Serialize());
-        AutoCommit();
+            var metadata = LoadMetadata(record);
+            metadata[key] = value;
+            record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
+            record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _tree.Update(treeKey, record.Serialize());
+            AutoCommit();
+        }
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     /// <summary>Gets a metadata value by key, or null if not found.</summary>
@@ -874,17 +954,25 @@ public sealed class ObjectEngine : IDisposable
     public bool DeleteMetadata(ulong id, string key)
     {
         ThrowIfReadOnly();
-        var (treeKey, record) = FindById(id);
-        if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+        try
+        {
+            var (treeKey, record) = FindById(id);
+            if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
 
-        var metadata = LoadMetadata(record);
-        if (!metadata.Remove(key)) return false;
+            var metadata = LoadMetadata(record);
+            if (!metadata.Remove(key)) return false;
 
-        record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
-        record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        _tree.Update(treeKey, record.Serialize());
-        AutoCommit();
-        return true;
+            record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
+            record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _tree.Update(treeKey, record.Serialize());
+            AutoCommit();
+            return true;
+        }
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     private Dictionary<string, string> LoadMetadata(NodeRecord record)
@@ -963,7 +1051,8 @@ public sealed class ObjectEngine : IDisposable
         {
             try
             {
-                _file.AcquireWriteLock(_lockTimeout);
+                if (!_writeLockHeld)
+                    _file.AcquireWriteLock(_lockTimeout);
                 try
                 {
                     SetDirtyFlag(false);
@@ -971,6 +1060,7 @@ public sealed class ObjectEngine : IDisposable
                 finally
                 {
                     _file.ReleaseWriteLock();
+                    _writeLockHeld = false;
                 }
             }
             catch { /* best-effort */ }

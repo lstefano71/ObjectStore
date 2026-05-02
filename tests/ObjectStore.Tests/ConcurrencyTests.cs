@@ -266,4 +266,231 @@ public class ConcurrencyTests : IDisposable
         engine1.Refresh();
         Assert.True(engine1.Exists(id));
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Lock-leak non-regression tests
+    // These verify that early-return paths and exceptions in mutation
+    // methods properly release the write lock so subsequent writes succeed.
+    // ──────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void DeleteNonExistentObject_DoesNotLeakLock()
+    {
+        using var engine = ObjectEngine.Create(_path);
+        bool deleted = engine.DeleteObject(99999);
+        Assert.False(deleted);
+
+        // If the lock leaked, this next write would deadlock or timeout
+        var id = engine.CreateObject("after_failed_delete");
+        Assert.True(engine.Exists(id));
+    }
+
+    [Fact]
+    public void DeleteNonExistentObject_DoesNotLeakLock_TwoHandles()
+    {
+        using var engine1 = ObjectEngine.Create(_path);
+        using var engine2 = ObjectEngine.Open(_path);
+
+        // Engine1 tries to delete non-existent ID
+        bool deleted = engine1.DeleteObject(99999);
+        Assert.False(deleted);
+
+        // Engine2 should be able to write (lock not held by engine1)
+        engine2.Refresh();
+        var id = engine2.CreateObject("from_engine2");
+        Assert.True(engine2.Exists(id));
+    }
+
+    [Fact]
+    public void TruncateNoOp_DoesNotLeakLock()
+    {
+        using var engine = ObjectEngine.Create(_path);
+        var id = engine.CreateObject("obj");
+        engine.Append(id, new byte[100]);
+
+        // Truncate to >= current size is a no-op (early return)
+        engine.Truncate(id, 200);
+
+        // Subsequent write must succeed
+        var id2 = engine.CreateObject("after_noop_truncate");
+        Assert.True(engine.Exists(id2));
+    }
+
+    [Fact]
+    public void TruncateNoOp_DoesNotLeakLock_TwoHandles()
+    {
+        using var engine1 = ObjectEngine.Create(_path);
+        var id = engine1.CreateObject("obj");
+        engine1.Append(id, new byte[100]);
+
+        using var engine2 = ObjectEngine.Open(_path);
+
+        // Truncate to >= current size on engine1
+        engine1.Truncate(id, 200);
+
+        // Engine2 must be able to write
+        engine2.Refresh();
+        var id2 = engine2.CreateObject("from_engine2");
+        Assert.True(engine2.Exists(id2));
+    }
+
+    [Fact]
+    public void DeleteMissingMetadataKey_DoesNotLeakLock()
+    {
+        using var engine = ObjectEngine.Create(_path);
+        var id = engine.CreateObject("obj");
+
+        // Delete a metadata key that doesn't exist (early return false)
+        bool removed = engine.DeleteMetadata(id, "nonexistent_key");
+        Assert.False(removed);
+
+        // Subsequent write must succeed
+        var id2 = engine.CreateObject("after_failed_meta_delete");
+        Assert.True(engine.Exists(id2));
+    }
+
+    [Fact]
+    public void DeleteMissingMetadataKey_DoesNotLeakLock_TwoHandles()
+    {
+        using var engine1 = ObjectEngine.Create(_path);
+        var id = engine1.CreateObject("obj");
+
+        using var engine2 = ObjectEngine.Open(_path);
+
+        bool removed = engine1.DeleteMetadata(id, "nonexistent_key");
+        Assert.False(removed);
+
+        // Engine2 must be able to write
+        engine2.Refresh();
+        var id2 = engine2.CreateObject("from_engine2");
+        Assert.True(engine2.Exists(id2));
+    }
+
+    [Fact]
+    public void AppendToNonExistent_DoesNotLeakLock()
+    {
+        using var engine = ObjectEngine.Create(_path);
+
+        Assert.Throws<ObjectNotFoundException>(() =>
+            engine.Append(99999, new byte[10]));
+
+        // Lock must be released — next write succeeds
+        var id = engine.CreateObject("after_failed_append");
+        Assert.True(engine.Exists(id));
+    }
+
+    [Fact]
+    public void WriteAtNonExistent_DoesNotLeakLock()
+    {
+        using var engine = ObjectEngine.Create(_path);
+
+        Assert.Throws<ObjectNotFoundException>(() =>
+            engine.WriteAt(99999, 0, new byte[10]));
+
+        var id = engine.CreateObject("after_failed_writeat");
+        Assert.True(engine.Exists(id));
+    }
+
+    [Fact]
+    public void WriteAtBeyondSize_DoesNotLeakLock()
+    {
+        using var engine = ObjectEngine.Create(_path);
+        var id = engine.CreateObject("small");
+        engine.Append(id, new byte[10]);
+
+        Assert.Throws<ArgumentException>(() =>
+            engine.WriteAt(id, 5, new byte[100]));
+
+        // Lock must be released
+        var id2 = engine.CreateObject("after_bad_writeat");
+        Assert.True(engine.Exists(id2));
+    }
+
+    [Fact]
+    public void SetMetadataNonExistent_DoesNotLeakLock()
+    {
+        using var engine = ObjectEngine.Create(_path);
+
+        Assert.Throws<ObjectNotFoundException>(() =>
+            engine.SetMetadata(99999, "key", "value"));
+
+        var id = engine.CreateObject("after_failed_setmeta");
+        Assert.True(engine.Exists(id));
+    }
+
+    [Fact]
+    public void MoveNodeNonExistent_DoesNotLeakLock()
+    {
+        using var engine = ObjectEngine.Create(_path);
+
+        Assert.Throws<ObjectNotFoundException>(() =>
+            engine.MoveNode(99999, 1));
+
+        var id = engine.CreateObject("after_failed_move");
+        Assert.True(engine.Exists(id));
+    }
+
+    [Fact]
+    public void DeleteSubtreeNonExistent_DoesNotLeakLock()
+    {
+        using var engine = ObjectEngine.Create(_path);
+
+        Assert.Throws<ObjectNotFoundException>(() =>
+            engine.DeleteSubtree(99999));
+
+        var id = engine.CreateObject("after_failed_subtree_delete");
+        Assert.True(engine.Exists(id));
+    }
+
+    [Fact]
+    public void ExceptionDuringMutation_TwoHandles_DoesNotLeakLock()
+    {
+        using var engine1 = ObjectEngine.Create(_path);
+        using var engine2 = ObjectEngine.Open(_path);
+
+        // Cause an exception on engine1
+        Assert.Throws<ObjectNotFoundException>(() =>
+            engine1.Append(99999, new byte[10]));
+
+        // Engine2 must be able to write (engine1 didn't leak the lock)
+        engine2.Refresh();
+        var id = engine2.CreateObject("engine2_after_engine1_exception");
+        Assert.True(engine2.Exists(id));
+    }
+
+    [Fact]
+    public void DisposeWithHeldLock_DoesNotSpin()
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        var engine = ObjectEngine.Create(_path);
+        engine.BeginTransaction();
+        engine.CreateObject("in_txn");
+        // Dispose while transaction (and lock) is held
+        engine.Dispose();
+
+        sw.Stop();
+        // Should complete nearly instantly, not spin for 30s trying to re-acquire
+        Assert.True(sw.ElapsedMilliseconds < 5000,
+            $"Dispose took {sw.ElapsedMilliseconds}ms — should not spin waiting for lock");
+    }
+
+    [Fact]
+    public void MultipleFailedOperations_LockNeverLeaks()
+    {
+        using var engine = ObjectEngine.Create(_path);
+
+        // Hammer multiple failing operations
+        for (int i = 0; i < 20; i++)
+        {
+            engine.DeleteObject((ulong)(90000 + i));
+            Assert.Throws<ObjectNotFoundException>(() => engine.Append((ulong)(80000 + i), new byte[5]));
+            engine.DeleteMetadata(engine.CreateObject($"temp_{i}"), "no_such_key");
+        }
+
+        // After all those failures, the engine must still be fully functional
+        var id = engine.CreateObject("still_works");
+        engine.Append(id, new byte[1000]);
+        Assert.Equal(1000, engine.GetInfo(id)!.Size);
+    }
 }
