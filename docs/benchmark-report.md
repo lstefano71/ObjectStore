@@ -1,0 +1,276 @@
+# ObjectStore Benchmark Report
+
+**Date:** 2026-05-02  
+**System:** Intel Core i7-6700 @ 3.40 GHz (Skylake), 4 cores / 8 threads  
+**RAM:** 16 GB DDR4  
+**OS:** Windows 10 22H2  
+**Runtime:** .NET 10.0.7 (NativeAOT for C ABI), Python 3.14.3  
+**Disks:**
+- **SSD (C:):** SATA SSD (system drive, used via `C:\Users\stf\AppData\Local\Temp\`)
+- **HDD (D:):** 7200 RPM mechanical hard drive
+
+---
+
+## 1. What Is Tested
+
+ObjectStore is a single-file, crash-safe, MVCC-capable binary object store with:
+- Copy-on-Write (COW) B-tree for metadata
+- Buddy allocator for block management
+- Byte-range file locking for multi-process write serialization
+- Auto-commit per mutation (each write = acquire lock + mutate + fsync + release lock)
+- Transaction batching to amortize commit cost
+
+### Operations Benchmarked
+
+| Operation | Description |
+|-----------|-------------|
+| **CreateObject** | Allocate ID, insert into B-tree + ID-index, commit |
+| **AppendSmall** | Append 100–256 bytes to existing object (COW last block or allocate new) |
+| **AppendLarge** | Append 64KB to existing object (multi-block allocation) |
+| **ReadSmall** | Read 100–256 byte object (B-tree lookup + single block read) |
+| **ReadLarge** | Read 64KB object (B-tree lookup + extent list + multi-block read) |
+| **WriteAt** | Overwrite 100 bytes in middle of 64KB object (COW affected block) |
+| **DeleteObject** | B-tree delete + free all extents + commit |
+| **MetadataSetGet** | Set a key-value pair then read it back |
+| **TransactionBatch** | Begin txn → create N objects with data → commit (single fsync) |
+| **MixedWorkload** | Random interleaving of reads and writes at configurable ratio |
+| **ConcurrentWrite** | N independent writer processes, each creating objects |
+| **ConcurrentRead** | N independent reader processes reading pre-populated data |
+| **MixedMultiProcess** | N hybrid (reader+writer) processes with configurable write ratio |
+
+---
+
+## 2. How It's Tested
+
+### 2.1 Single-Process Micro-Benchmarks (BenchmarkDotNet)
+
+- **Project:** `tests/ObjectStore.Benchmarks/`
+- **Framework:** BenchmarkDotNet 0.14 with ShortRun job (3 warmup, 10 iterations)
+- **Method:** Direct C# API calls to `ObjectEngine` (no FFI overhead)
+- **Disk selection:** `BENCH_TMPDIR` environment variable (defaults to system temp on C:)
+- **Isolation:** Fresh database file per benchmark class; cleanup on teardown
+
+Each benchmark method is a single atomic operation. BenchmarkDotNet handles warmup, iteration, GC collection counting, and statistical analysis automatically.
+
+### 2.2 Multi-Process Benchmarks (Python via C ABI)
+
+- **Script:** `tests/python/benchmark_multiprocess.py`
+- **Method:** Python `ctypes` FFI calling the NativeAOT-published `ObjectStore.Native.dll`
+- **Parallelism:** Python `multiprocessing.Pool` spawning independent OS processes
+- **Disk selection:** `--tmpdir` CLI argument (defaults to system temp on C:)
+- **Measurement:** `time.perf_counter()` wall-clock timing around the work loop
+- **Isolation:** Fresh database created per scenario; each process opens independently
+
+Each worker process loads the DLL, opens the database (shared file access), and performs its workload. For write benchmarks, each object gets a unique name to avoid conflicts. Write lock serialization is handled transparently by the engine.
+
+### 2.3 Run Commands
+
+```bash
+# BenchmarkDotNet (single-process, SSD)
+dotnet run -c Release --project tests/ObjectStore.Benchmarks -- --filter "*"
+
+# BenchmarkDotNet (single-process, HDD)
+$env:BENCH_TMPDIR = "D:\bench_tmp"
+dotnet run -c Release --project tests/ObjectStore.Benchmarks -- --filter "*"
+
+# Python multi-process (SSD, quick mode)
+python tests/python/benchmark_multiprocess.py --quick
+
+# Python multi-process (HDD)
+python tests/python/benchmark_multiprocess.py --quick --tmpdir D:\bench_tmp
+
+# Python multi-process (full mode, more iterations)
+python tests/python/benchmark_multiprocess.py
+```
+
+---
+
+## 3. Results: Single-Process (BenchmarkDotNet)
+
+### 3.1 SSD (C:) — Individual Operations
+
+| Method | Mean | Std Dev | ops/sec | Allocated |
+|--------|-----:|--------:|--------:|----------:|
+| ReadSmall (100B) | 8.1 μs | 0.26 μs | **123,270** | 33 KB |
+| ReadLarge (64KB) | 108.0 μs | 1.7 μs | **9,260** | 161 KB |
+| MetadataSetGet | 2,123 μs | 69 μs | **471** | 117 KB |
+| AppendSmall (100B) | 2,705 μs | 79 μs | **370** | 440 KB |
+| CreateObject | 3,257 μs | 245 μs | **307** | 351 KB |
+| WriteAtMiddle (100B in 64KB) | 3,319 μs | 64 μs | **301** | 468 KB |
+| AppendLarge (64KB) | 3,480 μs | 82 μs | **287** | 711 KB |
+| DeleteObject | 4,733 μs | 227 μs | **211** | 232 KB |
+
+### 3.2 SSD (C:) — Transaction Batching
+
+| Batch Size | Total Time | Per-Object | Amortized ops/sec | Allocated |
+|-----------:|-----------:|-----------:|------------------:|----------:|
+| 10 | 11.6 ms | 1.16 ms | **859** | 3.4 MB |
+| 100 | 79.4 ms | 0.79 ms | **1,260** | 34.4 MB |
+| 1000 | 787 ms | 0.79 ms | **1,270** | 345 MB |
+
+### 3.3 SSD (C:) — Mixed Workload (per-operation average)
+
+| Ratio | Mean/op | ops/sec |
+|-------|--------:|--------:|
+| 80% Read / 20% Write | 669 μs | **1,494** |
+| 50% Read / 50% Write | 1,617 μs | **618** |
+
+---
+
+## 4. Results: Multi-Process (Python C ABI)
+
+### 4.1 SSD (C:) — Sequential (Single Process via FFI)
+
+| Scenario | ops/sec | MB/s |
+|----------|--------:|-----:|
+| Sequential Write (256B) | **174** | 0.04 |
+| Sequential Write (64KB) | **126** | 7.9 |
+| Sequential Write (1MB) | **69** | 68.7 |
+| Sequential Read (256B) | **27,925** | 6.8 |
+| Sequential Read (64KB) | **9,906** | 619 |
+| Sequential Read (1MB) | **618** | 618 |
+| Transaction Batch (200 × 256B) | **787** | 0.19 |
+
+### 4.2 SSD (C:) — Multi-Process Write Scaling
+
+| Writers | ops/sec | Scaling vs 1 |
+|--------:|--------:|-------------:|
+| 1 | 92 | 100% |
+| 2 | 128 | 139% |
+| 4 | 142 | 154% |
+| 8 | 153 | 166% |
+
+Writes are serialized by the file lock, so throughput plateaus quickly. The modest improvement from 1→8 comes from pipelining: while one writer fsyncs, another can prepare its mutation.
+
+### 4.3 SSD (C:) — Multi-Process Read Scaling
+
+| Readers | ops/sec | Scaling vs 1 |
+|--------:|--------:|-------------:|
+| 1 | 2,129 | 100% |
+| 2 | 3,800 | 179% |
+| 4 | 7,830 | 368% |
+| 8 | 9,018 | 424% |
+
+Reads don't require locks and scale near-linearly up to physical core count (4 cores → 3.7x). Beyond that, hyperthreading provides diminishing returns.
+
+### 4.4 SSD (C:) — Multi-Process Mixed Workload
+
+| Scenario | ops/sec | MB/s |
+|----------|--------:|-----:|
+| 20% Write / 80% Read, 4 workers | **381** | 0.09 |
+| 50% Write / 50% Read, 4 workers | **233** | 0.06 |
+| 20% Write / 80% Read, 8 workers | **422** | 0.10 |
+
+Mixed workloads are dominated by write latency since even a small write percentage forces lock acquisition + fsync.
+
+---
+
+## 5. Results: HDD (D:) — Impact of Disk Latency
+
+### 5.1 HDD — Sequential (Single Process)
+
+| Scenario | ops/sec | MB/s |
+|----------|--------:|-----:|
+| Sequential Write (256B) | **5** | 0.001 |
+| Sequential Write (64KB) | **5** | 0.34 |
+| Sequential Read (256B) | **40,105** | 9.8 |
+| Sequential Read (64KB) | **9,046** | 565 |
+| Transaction Batch (200 × 256B) | **30** | 0.01 |
+
+### 5.2 HDD — Multi-Process Write Scaling
+
+| Writers | ops/sec | Scaling vs 1 |
+|--------:|--------:|-------------:|
+| 1 | 4 | 100% |
+| 2 | 5 | 114% |
+| 4 | 5 | 110% |
+
+Write throughput on HDD is completely dominated by fsync latency (~200ms per commit on a 7200 RPM drive).
+
+---
+
+## 6. SSD vs HDD Comparison
+
+| Operation | SSD (C:) | HDD (D:) | SSD Advantage |
+|-----------|-------:|-------:|--------:|
+| Sequential Write (256B) | 174 ops/s | 5 ops/s | **35×** |
+| Sequential Write (64KB) | 126 ops/s | 5 ops/s | **25×** |
+| Transaction Batch (200 objs) | 787 ops/s | 30 ops/s | **26×** |
+| Sequential Read (256B) | 27,925 ops/s | 40,105 ops/s | ~1× (cached) |
+| Sequential Read (64KB) | 9,906 ops/s | 9,046 ops/s | ~1× (cached) |
+| Concurrent Write (1 worker) | 92 ops/s | 4 ops/s | **23×** |
+
+**Key insight:** Reads are cached in memory (OS page cache) regardless of disk type. Writes are entirely gated by fsync latency.
+
+---
+
+## 7. Analysis and Observations
+
+### 7.1 Write Performance Is Fsync-Bound
+
+Every auto-commit mutation performs:
+1. Acquire byte-range lock (~negligible)
+2. COW B-tree nodes + allocator updates (~0.1–0.5 ms in memory)
+3. Write dirty blocks to file (~0.1 ms for small data)
+4. Flush FileStream + fsync (~3 ms SSD, ~200 ms HDD)
+5. Release lock
+
+The fsync cost dominates: **~95% of write latency is disk flush** on SSD, virtually 100% on HDD.
+
+### 7.2 Transaction Batching Provides 4× Improvement
+
+Batching 100 operations in a single transaction reduces per-object cost from 3.3 ms to 0.79 ms (4.2× improvement) by amortizing the single fsync across all mutations.
+
+### 7.3 Read Performance Is Excellent
+
+- Small reads: **8 μs** (limited by B-tree traversal + one block read from cache)
+- Large reads: **108 μs** (limited by extent list traversal + multi-block copy)
+- Reads scale linearly across processes (no lock contention)
+
+### 7.4 Memory Allocation
+
+- Write operations allocate 230–710 KB per operation (COW serialization buffers, B-tree nodes)
+- Read operations allocate 33–161 KB (primarily the read buffer)
+- Transaction batches allocate ~345 KB/object (cumulative B-tree COW nodes)
+- GC pressure is moderate; Gen2 collections occur during large batches
+
+### 7.5 Multi-Process Scaling
+
+- **Readers:** Near-linear scaling up to physical core count (4×), then diminishing returns from hyperthreading
+- **Writers:** Plateaus quickly (serialized by lock), but doesn't degrade — lock handoff is efficient
+- **Mixed:** Dominated by write fraction; a 20% write ratio still limits throughput to ~400 ops/s with 4-8 workers
+
+### 7.6 Recommendations for Production Use
+
+1. **Use transactions** for bulk operations — batching 100+ operations gives 4× throughput
+2. **Deploy on SSD** — writes are 25-35× faster than HDD
+3. **Reads scale freely** — add as many reader processes as needed
+4. **For write-heavy workloads**, consider application-level batching or write-behind queues
+5. **Large objects** (1MB+) achieve 69 MB/s write throughput even with per-commit fsync
+
+---
+
+## 8. Benchmark Infrastructure
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `tests/ObjectStore.Benchmarks/Benchmarks.cs` | BenchmarkDotNet benchmark classes |
+| `tests/ObjectStore.Benchmarks/Program.cs` | BenchmarkDotNet runner entry point |
+| `tests/ObjectStore.Benchmarks/ObjectStore.Benchmarks.csproj` | Project file with BenchmarkDotNet dependency |
+| `tests/python/benchmark_multiprocess.py` | Multi-process benchmark script (Python + C ABI) |
+
+### Configuration Options
+
+| Tool | Parameter | Effect |
+|------|-----------|--------|
+| Python | `--tmpdir PATH` | Place temp DB files on a specific disk |
+| Python | `--quick` | Reduce iteration count for faster feedback |
+| Python | `--lib PATH` | Override native DLL path |
+| C# | `BENCH_TMPDIR` env var | Place temp DB files on a specific disk |
+| C# | `--filter "Name"` | Run specific benchmark subset |
+
+---
+
+*Report generated from benchmark runs on 2026-05-02. Results may vary with OS caching state, background processes, and thermal throttling.*
