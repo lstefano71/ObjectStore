@@ -20,11 +20,12 @@ public static class BlockHeader
         int blockSize = raw.Length;
         int payloadCapacity = blockSize - FormatConstants.BlockHeaderSize;
 
-        // Zero the buffer first (ensures reserved bytes and unused payload area are zeroed)
-        raw.Clear();
-
         // Write payload at offset 16
         payload.CopyTo(raw[FormatConstants.BlockHeaderSize..]);
+
+        // Zero only the unused area after payload (ensures deterministic checksums)
+        if (payload.Length < payloadCapacity)
+            raw.Slice(FormatConstants.BlockHeaderSize + payload.Length, payloadCapacity - payload.Length).Clear();
 
         // Compute checksum over the full payload area (including zero padding)
         var payloadArea = raw.Slice(FormatConstants.BlockHeaderSize, payloadCapacity);
@@ -34,7 +35,10 @@ public static class BlockHeader
         BinaryPrimitives.WriteUInt32LittleEndian(raw, (uint)blockSize);
         BinaryPrimitives.WriteUInt64LittleEndian(raw[4..], checksum);
         raw[12] = flags;
-        // [13..15] reserved, already zero
+        // [13..15] reserved — zero them explicitly (3 bytes)
+        raw[13] = 0;
+        raw[14] = 0;
+        raw[15] = 0;
     }
 
     /// <summary>

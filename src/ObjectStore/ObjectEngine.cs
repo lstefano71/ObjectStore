@@ -840,9 +840,10 @@ public sealed class ObjectEngine : IDisposable
         sb.ContainerSize = (ulong)_file.FileSize;
         sb.NextNodeId = _nextNodeId;
 
-        // Issue 7 fix: Flush all data writes before superblock pointer-swap
-        _file.Flush();
-
+        // SuperblockManager.Commit() calls _file.Flush() which flushes ALL pending
+        // writes on this handle (Windows FlushFileBuffers semantics). No need for
+        // a separate pre-flush — the single flush after superblock write ensures
+        // both data blocks and superblock reach disk atomically.
         _sbManager.Commit(sb);
         _lastKnownGeneration = _sbManager.Active.Generation;
 

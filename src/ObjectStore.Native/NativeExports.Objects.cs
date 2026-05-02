@@ -164,9 +164,6 @@ public static partial class NativeExports
                 return NativeErrorCodes.InvalidArg;
             if (bufferLen < 0) return NativeErrorCodes.InvalidArg;
 
-            var info = engine.GetInfo(objectId);
-            if (info == null) return NativeErrorCodes.NotFound;
-
             var span = new Span<byte>(buffer, bufferLen);
             int bytesRead = engine.ReadAt(objectId, offset, span);
             *outBytesRead = bytesRead;
