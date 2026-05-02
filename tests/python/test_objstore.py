@@ -455,3 +455,154 @@ class TestPhase6Options:
         rc = lib.objstore_options_set_encryption_key(opts, None, 0)
         assert rc == 0
         lib.objstore_options_free(opts)
+
+
+# ============================================================
+# Phase 7 Tests — Metadata, Iterator, Stats
+# ============================================================
+
+class TestPhase7Metadata:
+    @pytest.fixture(autouse=True)
+    def setup(self, lib, tmp_path):
+        self.lib = lib
+        self.path = str(tmp_path / "phase7_meta.db").encode("utf-8")
+        self.handle = ctypes.c_void_p()
+        rc = lib.objstore_create(self.path, None, ctypes.byref(self.handle))
+        assert rc == 0
+        # Create an object
+        self.obj_id = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"meta-obj", ctypes.byref(self.obj_id))
+        yield
+        lib.objstore_close(self.handle)
+
+    def test_set_and_get_metadata(self):
+        lib = self.lib
+        rc = lib.objstore_metadata_set(self.handle, self.obj_id, b"author", b"Alice")
+        assert rc == 0
+
+        # Get length first (two-call pattern)
+        out_len = ctypes.c_int32()
+        rc = lib.objstore_metadata_get(self.handle, self.obj_id, b"author", None, 0, ctypes.byref(out_len))
+        assert rc == 0
+        assert out_len.value == 5  # "Alice"
+
+        # Get value
+        buf = ctypes.create_string_buffer(out_len.value)
+        rc = lib.objstore_metadata_get(self.handle, self.obj_id, b"author", buf, out_len.value, ctypes.byref(out_len))
+        assert rc == 0
+        assert buf.raw == b"Alice"
+
+    def test_get_missing_key(self):
+        lib = self.lib
+        out_len = ctypes.c_int32()
+        rc = lib.objstore_metadata_get(self.handle, self.obj_id, b"nope", None, 0, ctypes.byref(out_len))
+        assert rc == -2  # NOT_FOUND
+
+    def test_delete_metadata(self):
+        lib = self.lib
+        lib.objstore_metadata_set(self.handle, self.obj_id, b"key", b"val")
+        rc = lib.objstore_metadata_delete(self.handle, self.obj_id, b"key")
+        assert rc == 0
+
+        # Verify gone
+        out_len = ctypes.c_int32()
+        rc = lib.objstore_metadata_get(self.handle, self.obj_id, b"key", None, 0, ctypes.byref(out_len))
+        assert rc == -2
+
+    def test_buffer_too_small(self):
+        lib = self.lib
+        lib.objstore_metadata_set(self.handle, self.obj_id, b"k", b"longvalue")
+        buf = ctypes.create_string_buffer(3)  # too small for "longvalue" (9 bytes)
+        out_len = ctypes.c_int32()
+        rc = lib.objstore_metadata_get(self.handle, self.obj_id, b"k", buf, 3, ctypes.byref(out_len))
+        assert rc == -6  # BUFFER_TOO_SMALL
+        assert out_len.value == 9
+
+
+class TestPhase7Iterator:
+    @pytest.fixture(autouse=True)
+    def setup(self, lib, tmp_path):
+        self.lib = lib
+        self.path = str(tmp_path / "phase7_iter.db").encode("utf-8")
+        self.handle = ctypes.c_void_p()
+        rc = lib.objstore_create(self.path, None, ctypes.byref(self.handle))
+        assert rc == 0
+        yield
+        lib.objstore_close(self.handle)
+
+    def test_iterate_objects(self):
+        lib = self.lib
+        # Create 3 objects with data
+        ids = []
+        for name in [b"obj-a", b"obj-b", b"obj-c"]:
+            obj_id = ctypes.c_uint64()
+            lib.objstore_object_create(self.handle, name, ctypes.byref(obj_id))
+            data = b"x" * 50
+            lib.objstore_append(self.handle, obj_id, data, 50)
+            ids.append(obj_id.value)
+
+        # Iterate
+        iter_handle = ctypes.c_void_p()
+        rc = lib.objstore_list_begin(self.handle, ctypes.byref(iter_handle))
+        assert rc == 0
+
+        found_ids = []
+        while True:
+            out_id = ctypes.c_uint64()
+            out_size = ctypes.c_int64()
+            rc = lib.objstore_iter_next(iter_handle, ctypes.byref(out_id), ctypes.byref(out_size))
+            if rc == 1:  # end
+                break
+            assert rc == 0
+            found_ids.append(out_id.value)
+            assert out_size.value == 50
+
+        assert sorted(found_ids) == sorted(ids)
+
+        rc = lib.objstore_iter_close(iter_handle)
+        assert rc == 0
+
+    def test_iterate_empty_store(self):
+        lib = self.lib
+        iter_handle = ctypes.c_void_p()
+        rc = lib.objstore_list_begin(self.handle, ctypes.byref(iter_handle))
+        assert rc == 0
+
+        out_id = ctypes.c_uint64()
+        out_size = ctypes.c_int64()
+        rc = lib.objstore_iter_next(iter_handle, ctypes.byref(out_id), ctypes.byref(out_size))
+        assert rc == 1  # end immediately
+
+        lib.objstore_iter_close(iter_handle)
+
+
+class TestPhase7Stats:
+    @pytest.fixture(autouse=True)
+    def setup(self, lib, tmp_path):
+        self.lib = lib
+        self.path = str(tmp_path / "phase7_stats.db").encode("utf-8")
+        self.handle = ctypes.c_void_p()
+        rc = lib.objstore_create(self.path, None, ctypes.byref(self.handle))
+        assert rc == 0
+        yield
+        lib.objstore_close(self.handle)
+
+    def test_get_stats(self):
+        lib = self.lib
+        # Create 2 objects with known sizes
+        id1 = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"s1", ctypes.byref(id1))
+        lib.objstore_append(self.handle, id1, b"a" * 100, 100)
+
+        id2 = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"s2", ctypes.byref(id2))
+        lib.objstore_append(self.handle, id2, b"b" * 200, 200)
+
+        count = ctypes.c_int32()
+        total_size = ctypes.c_int64()
+        file_size = ctypes.c_int64()
+        rc = lib.objstore_get_stats(self.handle, ctypes.byref(count), ctypes.byref(total_size), ctypes.byref(file_size))
+        assert rc == 0
+        assert count.value == 2
+        assert total_size.value == 300
+        assert file_size.value > 0

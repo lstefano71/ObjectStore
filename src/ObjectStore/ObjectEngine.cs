@@ -386,6 +386,113 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Restores the next node ID counter (used by TransactionManager on rollback).</summary>
     internal void RestoreNextNodeId(ulong id) => _nextNodeId = id;
 
+    // --- Metadata ---
+
+    /// <summary>Sets a metadata key-value pair on an object.</summary>
+    public void SetMetadata(ulong id, string key, string value)
+    {
+        var (treeKey, record) = FindById(id);
+        if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+
+        var metadata = LoadMetadata(record);
+        metadata[key] = value;
+        record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
+        record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _tree.Update(treeKey, record.Serialize());
+        AutoCommit();
+    }
+
+    /// <summary>Gets a metadata value by key, or null if not found.</summary>
+    public string? GetMetadata(ulong id, string key)
+    {
+        var (_, record) = FindById(id);
+        if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+
+        var metadata = LoadMetadata(record);
+        return metadata.GetValueOrDefault(key);
+    }
+
+    /// <summary>Deletes a metadata key. Returns true if the key existed.</summary>
+    public bool DeleteMetadata(ulong id, string key)
+    {
+        var (treeKey, record) = FindById(id);
+        if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+
+        var metadata = LoadMetadata(record);
+        if (!metadata.Remove(key)) return false;
+
+        record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
+        record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _tree.Update(treeKey, record.Serialize());
+        AutoCommit();
+        return true;
+    }
+
+    private Dictionary<string, string> LoadMetadata(NodeRecord record)
+    {
+        if (record.MetadataBlockAddress == 0)
+            return new Dictionary<string, string>();
+
+        int order = GetBlockOrderFromHeader(record.MetadataBlockAddress);
+        byte[] data = _file.ReadBlock(record.MetadataBlockAddress, order);
+        return DeserializeMetadata(data);
+    }
+
+    private long SaveMetadata(Dictionary<string, string> metadata, long oldAddress)
+    {
+        byte[] data = SerializeMetadata(metadata);
+        int order = FormatConstants.OrderForPayload(data.Length);
+
+        if (oldAddress != 0)
+            DeferredFreeExtentListBlock(oldAddress); // reuses the same free helper
+
+        long addr = _allocator.Allocate(order);
+        _file.WriteBlock(addr, order, data);
+        return addr;
+    }
+
+    private static byte[] SerializeMetadata(Dictionary<string, string> metadata)
+    {
+        // Format: [count:u16] [key_len:u16 key_bytes value_len:u16 value_bytes]...
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+        bw.Write((ushort)metadata.Count);
+        foreach (var (key, value) in metadata)
+        {
+            byte[] keyBytes = System.Text.Encoding.UTF8.GetBytes(key);
+            byte[] valueBytes = System.Text.Encoding.UTF8.GetBytes(value);
+            bw.Write((ushort)keyBytes.Length);
+            bw.Write(keyBytes);
+            bw.Write((ushort)valueBytes.Length);
+            bw.Write(valueBytes);
+        }
+        return ms.ToArray();
+    }
+
+    private static Dictionary<string, string> DeserializeMetadata(ReadOnlySpan<byte> data)
+    {
+        var result = new Dictionary<string, string>();
+        if (data.Length < 2) return result;
+
+        int offset = 0;
+        ushort count = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(data[offset..]);
+        offset += 2;
+
+        for (int i = 0; i < count && offset < data.Length; i++)
+        {
+            ushort keyLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(data[offset..]);
+            offset += 2;
+            string key = System.Text.Encoding.UTF8.GetString(data.Slice(offset, keyLen));
+            offset += keyLen;
+            ushort valueLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(data[offset..]);
+            offset += 2;
+            string value = System.Text.Encoding.UTF8.GetString(data.Slice(offset, valueLen));
+            offset += valueLen;
+            result[key] = value;
+        }
+        return result;
+    }
+
     public void Dispose()
     {
         _file.Dispose();
