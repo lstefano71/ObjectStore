@@ -71,6 +71,7 @@ int objstore_options_create(objstore_options_t* out_opts);
 int objstore_options_free(objstore_options_t opts);
 int objstore_options_set_read_only(objstore_options_t opts, int read_only);
 int objstore_options_set_shared_access(objstore_options_t opts, int shared);
+int objstore_options_set_multi_process(objstore_options_t opts, int enabled);
 int objstore_options_set_cache_max_bytes(objstore_options_t opts, int64_t bytes);
 int objstore_options_set_lock_timeout_ms(objstore_options_t opts, int32_t ms);
 int objstore_options_set_encryption_key(objstore_options_t opts, const uint8_t* key, size_t key_len);

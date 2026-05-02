@@ -49,6 +49,7 @@ public sealed class ObjectStoreDatabase : IDisposable
             int blockCapacity = (int)(options.CacheMaxBytes / FormatConstants.MinBlockSize);
             engine.File.SetCacheCapacity(Math.Max(16, blockCapacity));
         }
+        engine.MultiProcessMode = options.MultiProcessMode;
     }
 
     // --- Object Operations ---

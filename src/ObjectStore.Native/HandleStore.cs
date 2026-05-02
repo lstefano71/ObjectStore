@@ -35,6 +35,7 @@ public sealed class NativeOptions
 {
     public bool ReadOnly { get; set; }
     public bool SharedAccess { get; set; }
+    public bool MultiProcessMode { get; set; }
     public long CacheMaxBytes { get; set; } = 32 * 1024 * 1024;
     public int LockTimeoutMs { get; set; } = 30_000;
     public byte[]? EncryptionKey { get; set; }

@@ -61,6 +61,23 @@ public static partial class NativeExports
         }
     }
 
+    [UnmanagedCallersOnly(EntryPoint = "objstore_options_set_multi_process")]
+    public static int OptionsSetMultiProcess(IntPtr opts, int value)
+    {
+        try
+        {
+            var o = HandleStore.Get<NativeOptions>(opts);
+            if (o == null) return NativeErrorCodes.InvalidArg;
+            o.MultiProcessMode = value != 0;
+            NativeErrorHelper.ClearLastError();
+            return NativeErrorCodes.Ok;
+        }
+        catch (Exception ex)
+        {
+            return NativeErrorHelper.Capture(ex);
+        }
+    }
+
     [UnmanagedCallersOnly(EntryPoint = "objstore_options_set_cache_max_bytes")]
     public static int OptionsSetCacheMaxBytes(IntPtr opts, long value)
     {

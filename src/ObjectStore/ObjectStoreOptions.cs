@@ -16,4 +16,12 @@ public sealed class ObjectStoreOptions
 
     /// <summary>Open in read-only mode (no writes allowed).</summary>
     public bool ReadOnly { get; set; }
+
+    /// <summary>
+    /// When true, reads automatically check whether another process has committed
+    /// new data and refresh before returning. Required for multi-process readers
+    /// to see writes from other processes without manually calling Refresh().
+    /// Adds ~1μs per read for the generation check. Default: false.
+    /// </summary>
+    public bool MultiProcessMode { get; set; }
 }

@@ -26,6 +26,12 @@ public sealed class ObjectEngine : IDisposable
     private const int IdCacheCapacity = 1024;
     private readonly Dictionary<ulong, (BTreeKey Key, NodeRecord Record)> _idCache = new();
 
+    /// <summary>
+    /// When true, read operations automatically check the superblock generation
+    /// and refresh if another process has committed. Required for multi-process readers.
+    /// </summary>
+    public bool MultiProcessMode { get; set; }
+
     public ContainerFile File => _file;
     public BuddyAllocator Allocator => _allocator;
     public BTree Tree => _tree;
@@ -205,6 +211,18 @@ public sealed class ObjectEngine : IDisposable
         RefreshFromDisk();
     }
 
+    /// <summary>
+    /// Lightweight staleness check: re-reads the superblock and refreshes only if
+    /// another process has committed (generation changed). Called automatically
+    /// before reads when MultiProcessMode is enabled.
+    /// </summary>
+    private void RefreshIfStale()
+    {
+        if (!MultiProcessMode) return;
+        _file.RefreshFileSize();
+        RefreshFromDisk(); // no-op if generation unchanged
+    }
+
     /// <summary>Creates a new object with optional name. Returns the assigned ID.</summary>
     public ulong CreateObject(string? name = null, byte compressionCodec = 0)
     {
@@ -252,6 +270,7 @@ public sealed class ObjectEngine : IDisposable
         {
             var (key, record) = FindById(id);
             if (record == null) return false;
+            IdCacheInvalidate(id); // Invalidate before mutation
 
             // Free extent data
             if (record.ExtentListAddress != 0)
@@ -264,7 +283,6 @@ public sealed class ObjectEngine : IDisposable
 
             _tree.Delete(key);
             _idTree.Delete(new BTreeKey(0, id));
-            IdCacheInvalidate(id);
             AutoCommit();
             return true;
         }
@@ -278,6 +296,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Checks if an object exists by ID.</summary>
     public bool Exists(ulong id)
     {
+        RefreshIfStale();
         var (_, record) = FindById(id);
         return record != null;
     }
@@ -285,6 +304,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Gets the NodeRecord for an object by ID.</summary>
     public NodeRecord? GetInfo(ulong id)
     {
+        RefreshIfStale();
         var (_, record) = FindById(id);
         return record;
     }
@@ -297,6 +317,7 @@ public sealed class ObjectEngine : IDisposable
         {
             var (key, record) = FindById(id);
             if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+            IdCacheInvalidate(id); // Invalidate before mutation to prevent stale cache on failure
 
             long newSize = record.Size + data.Length;
 
@@ -316,7 +337,6 @@ public sealed class ObjectEngine : IDisposable
                     record.Size = newSize;
                     record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                     _tree.Update(key, record.Serialize());
-                    IdCacheInvalidate(id);
                     AutoCommit();
                     return;
                 }
@@ -386,7 +406,6 @@ public sealed class ObjectEngine : IDisposable
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
             _tree.Update(key, record.Serialize());
-            IdCacheInvalidate(id);
             AutoCommit();
         }
         finally
@@ -399,6 +418,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Reads data from an object at the given offset.</summary>
     public int ReadAt(ulong id, long offset, Span<byte> buffer)
     {
+        RefreshIfStale();
         var (_, record) = FindById(id);
         if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
         if (offset >= record.Size) return 0;
@@ -455,6 +475,7 @@ public sealed class ObjectEngine : IDisposable
             if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
             if (offset + data.Length > record.Size)
                 throw new ArgumentException("WriteAt cannot extend the object. Use Append instead.");
+            IdCacheInvalidate(id); // Invalidate before mutation
 
             // Inline path
             if (record.HasInlineData && record.InlineData != null)
@@ -462,7 +483,6 @@ public sealed class ObjectEngine : IDisposable
                 data.CopyTo(record.InlineData.AsSpan((int)offset));
                 record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 _tree.Update(key, record.Serialize());
-                IdCacheInvalidate(id);
                 AutoCommit();
                 return;
             }
@@ -502,7 +522,6 @@ public sealed class ObjectEngine : IDisposable
             record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _tree.Update(key, record.Serialize());
-            IdCacheInvalidate(id);
             AutoCommit();
         }
         finally
@@ -521,6 +540,7 @@ public sealed class ObjectEngine : IDisposable
             var (key, record) = FindById(id);
             if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
             if (newLength >= record.Size) return;
+            IdCacheInvalidate(id); // Invalidate before mutation
 
             // Inline path
             if (record.HasInlineData && record.InlineData != null)
@@ -537,7 +557,6 @@ public sealed class ObjectEngine : IDisposable
                 record.Size = newLength;
                 record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 _tree.Update(key, record.Serialize());
-                IdCacheInvalidate(id);
                 AutoCommit();
                 return;
             }
@@ -561,7 +580,6 @@ public sealed class ObjectEngine : IDisposable
             record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _tree.Update(key, record.Serialize());
-            IdCacheInvalidate(id);
             AutoCommit();
         }
         finally
@@ -574,6 +592,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Lists all objects.</summary>
     public IEnumerable<NodeRecord> ListObjects()
     {
+        RefreshIfStale();
         foreach (var (_, value) in _tree.ScanAll())
             yield return NodeRecord.Deserialize(value);
     }
@@ -634,6 +653,7 @@ public sealed class ObjectEngine : IDisposable
         {
             var (oldKey, record) = FindById(nodeId);
             if (record == null) throw new ObjectNotFoundException($"Node {nodeId} not found.");
+            IdCacheInvalidate(nodeId); // Invalidate before mutation
 
             // Cycle detection: ensure newParentId is not a descendant of nodeId
             if (IsDescendantOf(newParentId, nodeId))
@@ -659,7 +679,6 @@ public sealed class ObjectEngine : IDisposable
 
             // Update ID index to point to the new primary key
             _idTree.Update(new BTreeKey(0, nodeId), newKey.Serialize());
-            IdCacheInvalidate(nodeId);
 
             // Update child counts
             UpdateChildCount(oldParentId, -1);
@@ -1010,13 +1029,13 @@ public sealed class ObjectEngine : IDisposable
         {
             var (treeKey, record) = FindById(id);
             if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+            IdCacheInvalidate(id); // Invalidate before mutation
 
             var metadata = LoadMetadata(record);
             metadata[key] = value;
             record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _tree.Update(treeKey, record.Serialize());
-            IdCacheInvalidate(id);
             AutoCommit();
         }
         finally
@@ -1029,6 +1048,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Gets a metadata value by key, or null if not found.</summary>
     public string? GetMetadata(ulong id, string key)
     {
+        RefreshIfStale();
         var (_, record) = FindById(id);
         if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
 
@@ -1044,6 +1064,7 @@ public sealed class ObjectEngine : IDisposable
         {
             var (treeKey, record) = FindById(id);
             if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
+            IdCacheInvalidate(id); // Invalidate before mutation
 
             var metadata = LoadMetadata(record);
             if (!metadata.Remove(key)) return false;
@@ -1051,7 +1072,6 @@ public sealed class ObjectEngine : IDisposable
             record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _tree.Update(treeKey, record.Serialize());
-            IdCacheInvalidate(id);
             AutoCommit();
             return true;
         }

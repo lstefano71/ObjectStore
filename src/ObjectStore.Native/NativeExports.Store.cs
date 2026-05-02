@@ -22,6 +22,8 @@ public static partial class NativeExports
                 return NativeErrorCodes.InvalidArg; // Cannot create in read-only mode
 
             var engine = ObjectEngine.Create(path);
+            if (opts?.MultiProcessMode == true)
+                engine.MultiProcessMode = true;
             *outHandle = HandleStore.Allocate(engine);
             NativeErrorHelper.ClearLastError();
             return NativeErrorCodes.Ok;
@@ -49,6 +51,8 @@ public static partial class NativeExports
             else
                 engine = ObjectEngine.Open(path);
 
+            if (opts?.MultiProcessMode == true)
+                engine.MultiProcessMode = true;
             *outHandle = HandleStore.Allocate(engine);
             NativeErrorHelper.ClearLastError();
             return NativeErrorCodes.Ok;
@@ -82,6 +86,8 @@ public static partial class NativeExports
                 engine = ObjectEngine.OpenOrCreate(path);
             }
 
+            if (opts?.MultiProcessMode == true)
+                engine.MultiProcessMode = true;
             *outHandle = HandleStore.Allocate(engine);
             NativeErrorHelper.ClearLastError();
             return NativeErrorCodes.Ok;
