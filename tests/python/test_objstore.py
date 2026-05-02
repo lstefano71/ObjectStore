@@ -606,3 +606,66 @@ class TestPhase7Stats:
         assert count.value == 2
         assert total_size.value == 300
         assert file_size.value > 0
+
+
+# ============================================================
+# Phase 8 Tests — Defragmentation & Recovery
+# ============================================================
+
+class TestPhase8Defragment:
+    @pytest.fixture(autouse=True)
+    def setup(self, lib, tmp_path):
+        self.lib = lib
+        self.path = str(tmp_path / "phase8_defrag.db").encode("utf-8")
+        self.handle = ctypes.c_void_p()
+        rc = lib.objstore_create(self.path, None, ctypes.byref(self.handle))
+        assert rc == 0
+        yield
+        lib.objstore_close(self.handle)
+
+    def test_defragment_basic(self):
+        lib = self.lib
+        # Create objects, delete some, defragment
+        ids = []
+        for i in range(5):
+            obj_id = ctypes.c_uint64()
+            lib.objstore_object_create(self.handle, f"obj{i}".encode(), ctypes.byref(obj_id))
+            lib.objstore_append(self.handle, obj_id, b"x" * 100, 100)
+            ids.append(obj_id.value)
+
+        # Delete odd-indexed
+        lib.objstore_object_delete(self.handle, ids[1])
+        lib.objstore_object_delete(self.handle, ids[3])
+
+        # Defragment
+        out_count = ctypes.c_int32()
+        rc = lib.objstore_defragment(self.handle, ctypes.byref(out_count))
+        assert rc == 0
+        assert out_count.value >= 2
+
+        # Verify remaining objects still readable
+        for idx in [0, 2, 4]:
+            buf = ctypes.create_string_buffer(100)
+            bytes_read = ctypes.c_int32()
+            rc = lib.objstore_read(self.handle, ids[idx], 0, buf, 100, ctypes.byref(bytes_read))
+            assert rc == 0
+            assert bytes_read.value == 100
+
+    def test_recover_clean_store(self):
+        lib = self.lib
+        # Create an object
+        obj_id = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"rec-obj", ctypes.byref(obj_id))
+        lib.objstore_append(self.handle, obj_id, b"data", 4)
+
+        # Recover on clean store
+        out_needed = ctypes.c_int32()
+        rc = lib.objstore_recover(self.handle, ctypes.byref(out_needed))
+        assert rc == 0
+
+        # Verify data still intact
+        buf = ctypes.create_string_buffer(4)
+        bytes_read = ctypes.c_int32()
+        rc = lib.objstore_read(self.handle, obj_id, 0, buf, 4, ctypes.byref(bytes_read))
+        assert rc == 0
+        assert buf.raw == b"data"

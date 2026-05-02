@@ -163,6 +163,28 @@ public sealed class ObjectStoreDatabase : IDisposable
         };
     }
 
+    // --- Maintenance ---
+
+    /// <summary>
+    /// Recovers the store after a dirty close by scanning reachable blocks
+    /// and rebuilding the allocator. Returns true if recovery was needed.
+    /// </summary>
+    public bool Recover()
+    {
+        ThrowIfDisposed();
+        return Recovery.Recover(_engine);
+    }
+
+    /// <summary>
+    /// Defragments the store by rewriting object data contiguously.
+    /// Returns the number of objects defragmented.
+    /// </summary>
+    public int Defragment()
+    {
+        ThrowIfDisposed();
+        return Defragmenter.Defragment(_engine);
+    }
+
     /// <summary>Access to the underlying engine (for advanced/test scenarios).</summary>
     internal ObjectEngine Engine => _engine;
 

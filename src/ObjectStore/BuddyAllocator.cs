@@ -246,4 +246,51 @@ public sealed class BuddyAllocator
 
         return address;
     }
+
+    /// <summary>Resets all free lists to empty (used during recovery rebuild).</summary>
+    public void Reset()
+    {
+        Array.Clear(_freeListHeads);
+        FreeBlockCount = 0;
+        _dataRegionEnd = FormatConstants.DataRegionOffset;
+    }
+
+    /// <summary>
+    /// Rebuilds the allocator from a set of reachable blocks.
+    /// Allocates space up to maxAllocated, then frees blocks not in the reachable set.
+    /// </summary>
+    public void RebuildFromReachable(long dataStart, long maxAllocated, HashSet<long> reachableBlocks, ContainerFile file)
+    {
+        _dataRegionEnd = maxAllocated;
+
+        // Walk through the data region, identify blocks from the reachable set
+        // and free everything else. We identify block boundaries by reading headers.
+        Span<byte> header = stackalloc byte[4];
+        long pos = dataStart;
+        while (pos < maxAllocated)
+        {
+            // Try to read block size from header
+            file.ReadRaw(pos, header);
+            int blockSize = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(header);
+
+            if (blockSize < FormatConstants.MinBlockSize || blockSize > FormatConstants.MaxBlockSize)
+            {
+                // Skip forward by minimum block size if we can't read a valid header
+                pos += FormatConstants.MinBlockSize;
+                continue;
+            }
+
+            int order = 0;
+            int sz = FormatConstants.MinBlockSize;
+            while (sz < blockSize && order < FormatConstants.OrderCount - 1) { order++; sz <<= 1; }
+
+            if (!reachableBlocks.Contains(pos))
+            {
+                // This block is not reachable — free it (without coalescing for simplicity)
+                PushFreeBlock(order, pos);
+            }
+
+            pos += blockSize;
+        }
+    }
 }

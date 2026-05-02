@@ -19,6 +19,7 @@ public sealed class ObjectEngine : IDisposable
     public BTree Tree => _tree;
     public ulong NextNodeId => _nextNodeId;
     public TransactionManager Transactions => _txn;
+    internal SuperblockManager SuperblockManager => _sbManager;
 
     private ObjectEngine(ContainerFile file, BuddyAllocator allocator, BTree tree,
                          SuperblockManager sbManager, ulong nextNodeId)
@@ -78,7 +79,12 @@ public sealed class ObjectEngine : IDisposable
         }
 
         var tree = new BTree(allocator, file, (long)active.BTreeRootAddress);
-        return new ObjectEngine(file, allocator, tree, sbManager, active.NextNodeId);
+        var engine = new ObjectEngine(file, allocator, tree, sbManager, active.NextNodeId);
+
+        // Set dirty flag on open (cleared on clean close)
+        engine.SetDirtyFlag(true);
+
+        return engine;
     }
 
     /// <summary>Opens or creates a container.</summary>
@@ -493,9 +499,33 @@ public sealed class ObjectEngine : IDisposable
         return result;
     }
 
+    private bool _disposed;
+
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+        // Clear dirty flag on clean close
+        try { SetDirtyFlag(false); } catch { /* best-effort */ }
         _file.Dispose();
+    }
+
+    /// <summary>Sets or clears the dirty-open flag and commits the superblock.</summary>
+    internal void SetDirtyFlag(bool dirty)
+    {
+        var sb = _sbManager.Active;
+        if (dirty)
+            sb.Flags |= Superblock.FlagDirtyOpen;
+        else
+            sb.Flags &= ~Superblock.FlagDirtyOpen;
+        _sbManager.Commit(sb);
+    }
+
+    /// <summary>Returns true if the store was opened with the dirty flag set.</summary>
+    public bool WasDirtyOnOpen()
+    {
+        // Dirty flag is set immediately on open, so check current state
+        return (_sbManager.Active.Flags & Superblock.FlagDirtyOpen) != 0;
     }
 
     /// <summary>

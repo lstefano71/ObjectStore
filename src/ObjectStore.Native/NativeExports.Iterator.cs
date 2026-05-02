@@ -118,4 +118,44 @@ public static partial class NativeExports
             return NativeErrorHelper.Capture(ex);
         }
     }
+
+    [UnmanagedCallersOnly(EntryPoint = "objstore_defragment")]
+    public static unsafe int DoDefragment(IntPtr storeHandle, int* outCount)
+    {
+        try
+        {
+            var engine = HandleStore.Get<ObjectEngine>(storeHandle);
+            if (engine == null) return NativeErrorCodes.InvalidArg;
+
+            int count = Defragmenter.Defragment(engine);
+            if (outCount != null) *outCount = count;
+
+            NativeErrorHelper.ClearLastError();
+            return NativeErrorCodes.Ok;
+        }
+        catch (Exception ex)
+        {
+            return NativeErrorHelper.Capture(ex);
+        }
+    }
+
+    [UnmanagedCallersOnly(EntryPoint = "objstore_recover")]
+    public static unsafe int DoRecover(IntPtr storeHandle, int* outNeeded)
+    {
+        try
+        {
+            var engine = HandleStore.Get<ObjectEngine>(storeHandle);
+            if (engine == null) return NativeErrorCodes.InvalidArg;
+
+            bool needed = Recovery.Recover(engine);
+            if (outNeeded != null) *outNeeded = needed ? 1 : 0;
+
+            NativeErrorHelper.ClearLastError();
+            return NativeErrorCodes.Ok;
+        }
+        catch (Exception ex)
+        {
+            return NativeErrorHelper.Capture(ex);
+        }
+    }
 }
