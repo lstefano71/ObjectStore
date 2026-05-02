@@ -14,6 +14,7 @@ public sealed class ObjectEngine : IDisposable
     private ulong _nextNodeId;
     private readonly TransactionManager _txn;
     private readonly bool _readOnly;
+    private int _lastBuddyBlockOrder; // order of the last committed buddy state block
 
     public ContainerFile File => _file;
     public BuddyAllocator Allocator => _allocator;
@@ -24,7 +25,8 @@ public sealed class ObjectEngine : IDisposable
     public bool IsReadOnly => _readOnly;
 
     private ObjectEngine(ContainerFile file, BuddyAllocator allocator, BTree tree,
-                         SuperblockManager sbManager, ulong nextNodeId, bool readOnly = false)
+                         SuperblockManager sbManager, ulong nextNodeId, bool readOnly = false,
+                         int lastBuddyBlockOrder = 0)
     {
         _file = file;
         _allocator = allocator;
@@ -33,6 +35,7 @@ public sealed class ObjectEngine : IDisposable
         _nextNodeId = nextNodeId;
         _txn = new TransactionManager(this);
         _readOnly = readOnly;
+        _lastBuddyBlockOrder = lastBuddyBlockOrder;
     }
 
     /// <summary>Creates a new container.</summary>
@@ -72,17 +75,19 @@ public sealed class ObjectEngine : IDisposable
             throw new IncompatibleVersionException(active.VersionMajor, active.VersionMinor);
 
         var allocator = new BuddyAllocator(file, FormatConstants.DataRegionOffset);
+        int lastBuddyOrder = 0;
 
         // Load buddy state if stored
         if (active.BuddyRootAddress != 0)
         {
-            int buddyOrder = ReadBlockOrderFromHeader(file, (long)active.BuddyRootAddress);
-            var buddyData = file.ReadBlock((long)active.BuddyRootAddress, buddyOrder);
+            lastBuddyOrder = ReadBlockOrderFromHeader(file, (long)active.BuddyRootAddress);
+            var buddyData = file.ReadBlock((long)active.BuddyRootAddress, lastBuddyOrder);
             allocator.Deserialize(buddyData);
         }
 
         var tree = new BTree(allocator, file, (long)active.BTreeRootAddress);
-        var engine = new ObjectEngine(file, allocator, tree, sbManager, active.NextNodeId);
+        var engine = new ObjectEngine(file, allocator, tree, sbManager, active.NextNodeId,
+            lastBuddyBlockOrder: lastBuddyOrder);
 
         // Set dirty flag on open (cleared on clean close)
         engine.SetDirtyFlag(true);
@@ -122,6 +127,28 @@ public sealed class ObjectEngine : IDisposable
         if (System.IO.File.Exists(path))
             return Open(path);
         return Create(path);
+    }
+
+    /// <summary>
+    /// Reloads the allocator and B-tree state from the latest committed superblock.
+    /// Used by writers in SharedAccess mode to get an up-to-date view after
+    /// acquiring the write lock (another writer may have committed since we opened).
+    /// </summary>
+    internal void RefreshFromDisk()
+    {
+        if (!_sbManager.TryLoad())
+            throw new InvalidOperationException("Failed to reload superblock.");
+
+        var active = _sbManager.Active;
+        if (active.BuddyRootAddress != 0)
+        {
+            _lastBuddyBlockOrder = ReadBlockOrderFromHeader(_file, (long)active.BuddyRootAddress);
+            var buddyData = _file.ReadBlock((long)active.BuddyRootAddress, _lastBuddyBlockOrder);
+            _allocator.Deserialize(buddyData);
+        }
+
+        _tree = new BTree(_allocator, _file, (long)active.BTreeRootAddress, _tree.Order);
+        _nextNodeId = active.NextNodeId;
     }
 
     /// <summary>Creates a new object with optional name. Returns the assigned ID.</summary>
@@ -579,19 +606,49 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Persists current state to superblock (called by TransactionManager on commit).</summary>
     internal void CommitInternal()
     {
-        // Save buddy state
-        byte[] buddyState = _allocator.Serialize();
-        int buddyOrder = FormatConstants.OrderForPayload(buddyState.Length);
-        long buddyAddr = _allocator.Allocate(buddyOrder);
-        _file.WriteBlock(buddyAddr, buddyOrder, buddyState);
-
         var sb = _sbManager.Active;
+
+        // Issue 5 fix: Free old buddy state block before allocating new one
+        if (sb.BuddyRootAddress != 0 && _lastBuddyBlockOrder > 0)
+            _allocator.Free((long)sb.BuddyRootAddress, _lastBuddyBlockOrder);
+
+        // Issue 6 fix: Allocate block first, then serialize (so serialized state
+        // reflects the allocation of its own storage block)
+        int estimatedSize = _allocator.SerializedSize;
+        int buddyOrder = FormatConstants.OrderForPayload(estimatedSize);
+        long buddyAddr = _allocator.Allocate(buddyOrder);
+
+        // Now serialize — this captures the state AFTER the buddy block allocation
+        byte[] buddyState = _allocator.Serialize();
+
+        // If the actual size exceeds the allocated block (unlikely but handle it)
+        int actualOrder = FormatConstants.OrderForPayload(buddyState.Length);
+        if (actualOrder > buddyOrder)
+        {
+            _allocator.Free(buddyAddr, buddyOrder);
+            buddyOrder = actualOrder;
+            buddyAddr = _allocator.Allocate(buddyOrder);
+            buddyState = _allocator.Serialize(); // re-serialize with updated state
+        }
+
+        _file.WriteBlock(buddyAddr, buddyOrder, buddyState);
+        _lastBuddyBlockOrder = buddyOrder;
+
         sb.BTreeRootAddress = (ulong)_tree.RootAddress;
         sb.BuddyRootAddress = (ulong)buddyAddr;
         sb.ContainerSize = (ulong)_file.FileSize;
         sb.NextNodeId = _nextNodeId;
+
+        // Issue 7 fix: Flush all data writes before superblock pointer-swap
+        _file.Flush();
+
         _sbManager.Commit(sb);
 
+        // Free old B-tree nodes that were replaced by COW mutations
+        // Safe to free after commit since the superblock now points to the new tree
+        int nodeOrder = _tree.Order; // B-tree node block order
+        foreach (long freedAddr in _tree.FreedBlocks)
+            _allocator.Free(freedAddr, GetBlockOrderFromHeader(freedAddr));
         _tree.FreedBlocks.Clear();
     }
 

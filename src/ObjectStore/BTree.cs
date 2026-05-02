@@ -56,12 +56,11 @@ public sealed class BTree
         var rootNode = ReadNode(RootAddress);
         if (rootNode.KeyCount >= 2 * _order - 1)
         {
-            // Split root
+            // Split root — SplitChild already adds old root address to FreedBlocks
             var newRoot = new BTreeNode { NodeType = BTreeNode.TypeInternal };
             newRoot.Children.Add(RootAddress);
             SplitChild(newRoot, 0);
             InsertNonFull(newRoot, key, value);
-            FreedBlocks.Add(RootAddress);
             RootAddress = WriteNode(newRoot);
         }
         else
@@ -183,7 +182,7 @@ public sealed class BTree
                 childIdx++;
             else if (key == node.Keys[childIdx])
             {
-                // Check: in a B+ tree, separator can equal a leaf key. Go right.
+                // B+ tree: separator can equal a leaf key. Go right.
                 childIdx++;
             }
             child = ReadNode(node.Children[childIdx]);

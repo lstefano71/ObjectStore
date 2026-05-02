@@ -16,7 +16,7 @@ public sealed class TransactionState
     public long WorkingRootAddress { get; set; }
 
     /// <summary>Buddy allocator snapshot at the start of this transaction/savepoint.</summary>
-    public long[] AllocatorSnapshot { get; set; } = [];
+    public List<long>[] AllocatorSnapshot { get; set; } = [];
     public long AllocatorDataRegionEnd { get; set; }
     public int AllocatorFreeBlockCount { get; set; }
 
@@ -39,7 +39,7 @@ public sealed class TransactionState
 public sealed class SavepointState
 {
     public long RootAddress { get; set; }
-    public long[] AllocatorSnapshot { get; set; } = [];
+    public List<long>[] AllocatorSnapshot { get; set; } = [];
     public long AllocatorDataRegionEnd { get; set; }
     public int AllocatorFreeBlockCount { get; set; }
     public int NewBlocksCount { get; set; }

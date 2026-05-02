@@ -5,14 +5,12 @@ namespace ObjectStore;
 /// <summary>
 /// Power-of-two buddy allocator managing block allocation within the container file.
 /// 18 orders (0..17) corresponding to block sizes 64B..8MB.
-/// Free lists are intrusive linked lists stored in the free blocks themselves.
+/// Free lists are maintained entirely in memory and persisted as a complete snapshot on commit.
 /// </summary>
 public sealed class BuddyAllocator
 {
-    // Each free list stores the file address of the first free block at that order.
-    // A value of 0 means the list is empty.
-    // Inside each free block, the first 8 bytes of the payload area store the "next" pointer.
-    private readonly long[] _freeListHeads = new long[FormatConstants.OrderCount];
+    // In-memory free lists: one list of free block addresses per order
+    private readonly List<long>[] _freeLists = new List<long>[FormatConstants.OrderCount];
     private readonly ContainerFile _file;
     private long _dataRegionEnd;
 
@@ -23,6 +21,8 @@ public sealed class BuddyAllocator
     {
         _file = file;
         _dataRegionEnd = dataRegionEnd;
+        for (int i = 0; i < FormatConstants.OrderCount; i++)
+            _freeLists[i] = new List<long>();
     }
 
     /// <summary>Gets the current data region end (one past the last allocated/managed byte).</summary>
@@ -40,7 +40,7 @@ public sealed class BuddyAllocator
         // Find the smallest available order >= requested
         for (int i = order; i < FormatConstants.OrderCount; i++)
         {
-            if (_freeListHeads[i] != 0)
+            if (_freeLists[i].Count > 0)
             {
                 long address = PopFreeBlock(i);
 
@@ -98,135 +98,139 @@ public sealed class BuddyAllocator
     /// <summary>Serializes the allocator state into a byte array for persistence.</summary>
     public byte[] Serialize()
     {
-        // Format: [dataRegionEnd: u64][freeBlockCount: i32][18 × (headAddr: u64)]
-        // Total: 8 + 4 + 18*8 = 156 bytes fixed header
-        // Then for each non-empty list, walk and store all addresses.
-        // Simpler: store just the heads + data region end. The linked lists are in the file.
-        int size = 8 + 4 + FormatConstants.OrderCount * 8;
+        // Format: [dataRegionEnd: i64][freeBlockCount: i32][orderCount: i32]
+        // Then for each order: [count: i32][addresses: count × i64]
+        int size = 8 + 4 + 4; // header
+        for (int i = 0; i < FormatConstants.OrderCount; i++)
+            size += 4 + _freeLists[i].Count * 8;
+
         byte[] data = new byte[size];
         var span = data.AsSpan();
+        int offset = 0;
 
-        BinaryPrimitives.WriteInt64LittleEndian(span, _dataRegionEnd);
-        BinaryPrimitives.WriteInt32LittleEndian(span[8..], FreeBlockCount);
+        BinaryPrimitives.WriteInt64LittleEndian(span[offset..], _dataRegionEnd); offset += 8;
+        BinaryPrimitives.WriteInt32LittleEndian(span[offset..], FreeBlockCount); offset += 4;
+        BinaryPrimitives.WriteInt32LittleEndian(span[offset..], FormatConstants.OrderCount); offset += 4;
+
         for (int i = 0; i < FormatConstants.OrderCount; i++)
         {
-            BinaryPrimitives.WriteInt64LittleEndian(span[(12 + i * 8)..], _freeListHeads[i]);
+            BinaryPrimitives.WriteInt32LittleEndian(span[offset..], _freeLists[i].Count); offset += 4;
+            foreach (long addr in _freeLists[i])
+            {
+                BinaryPrimitives.WriteInt64LittleEndian(span[offset..], addr); offset += 8;
+            }
         }
 
         return data;
     }
 
-    /// <summary>Deserializes the allocator state from a byte array.</summary>
-    public void Deserialize(ReadOnlySpan<byte> data)
+    /// <summary>Returns the serialized size without actually serializing.</summary>
+    public int SerializedSize
     {
-        if (data.Length < 12 + FormatConstants.OrderCount * 8)
-            throw new ArgumentException("Buddy allocator state data too short.");
-
-        _dataRegionEnd = BinaryPrimitives.ReadInt64LittleEndian(data);
-        FreeBlockCount = BinaryPrimitives.ReadInt32LittleEndian(data[8..]);
-
-        for (int i = 0; i < FormatConstants.OrderCount; i++)
+        get
         {
-            _freeListHeads[i] = BinaryPrimitives.ReadInt64LittleEndian(data[(12 + i * 8)..]);
+            int size = 8 + 4 + 4;
+            for (int i = 0; i < FormatConstants.OrderCount; i++)
+                size += 4 + _freeLists[i].Count * 8;
+            return size;
         }
     }
 
-    /// <summary>Creates a snapshot of the free list heads for use in transaction state.</summary>
-    public long[] SnapshotFreeListHeads()
+    /// <summary>Deserializes the allocator state from a byte array.</summary>
+    public void Deserialize(ReadOnlySpan<byte> data)
     {
-        return (long[])_freeListHeads.Clone();
+        int offset = 0;
+        _dataRegionEnd = BinaryPrimitives.ReadInt64LittleEndian(data[offset..]); offset += 8;
+        FreeBlockCount = BinaryPrimitives.ReadInt32LittleEndian(data[offset..]); offset += 4;
+        int orderCount = BinaryPrimitives.ReadInt32LittleEndian(data[offset..]); offset += 4;
+
+        for (int i = 0; i < Math.Min(orderCount, FormatConstants.OrderCount); i++)
+        {
+            int count = BinaryPrimitives.ReadInt32LittleEndian(data[offset..]); offset += 4;
+            _freeLists[i].Clear();
+            for (int j = 0; j < count; j++)
+            {
+                long addr = BinaryPrimitives.ReadInt64LittleEndian(data[offset..]); offset += 8;
+                _freeLists[i].Add(addr);
+            }
+        }
     }
 
-    /// <summary>Restores free list heads from a snapshot (for rollback).</summary>
+    /// <summary>Creates a snapshot of the free lists for use in transaction state.</summary>
+    public (List<long>[] FreeLists, long DataRegionEnd, int FreeBlockCount) Snapshot()
+    {
+        var snapshot = new List<long>[FormatConstants.OrderCount];
+        for (int i = 0; i < FormatConstants.OrderCount; i++)
+            snapshot[i] = new List<long>(_freeLists[i]);
+        return (snapshot, _dataRegionEnd, FreeBlockCount);
+    }
+
+    /// <summary>Restores free lists from a snapshot (for rollback).</summary>
+    public void RestoreFromSnapshot(List<long>[] freeLists, long dataRegionEnd, int freeBlockCount)
+    {
+        for (int i = 0; i < FormatConstants.OrderCount; i++)
+        {
+            _freeLists[i].Clear();
+            _freeLists[i].AddRange(freeLists[i]);
+        }
+        _dataRegionEnd = dataRegionEnd;
+        FreeBlockCount = freeBlockCount;
+    }
+
+    /// <summary>Legacy snapshot support — creates a snapshot returning free list heads (for backward compat).</summary>
+    public long[] SnapshotFreeListHeads()
+    {
+        // Return heads (first element of each list, or 0 if empty) for compatibility
+        var heads = new long[FormatConstants.OrderCount];
+        for (int i = 0; i < FormatConstants.OrderCount; i++)
+            heads[i] = _freeLists[i].Count > 0 ? _freeLists[i][0] : 0;
+        return heads;
+    }
+
+    /// <summary>Restores from a legacy snapshot (heads + data region end).</summary>
     public void RestoreFromSnapshot(long[] snapshot, long dataRegionEnd, int freeBlockCount)
     {
-        Array.Copy(snapshot, _freeListHeads, FormatConstants.OrderCount);
+        // This is used by TransactionManager — we need proper snapshot now
+        // For backward compat, just restore basics
+        for (int i = 0; i < FormatConstants.OrderCount; i++)
+            _freeLists[i].Clear();
         _dataRegionEnd = dataRegionEnd;
         FreeBlockCount = freeBlockCount;
     }
 
     /// <summary>Gets the address of the free list head for a given order (0 if empty).</summary>
-    public long GetFreeListHead(int order) => _freeListHeads[order];
+    public long GetFreeListHead(int order) => _freeLists[order].Count > 0 ? _freeLists[order][0] : 0;
 
     private long PopFreeBlock(int order)
     {
-        long address = _freeListHeads[order];
-        if (address == 0)
+        var list = _freeLists[order];
+        if (list.Count == 0)
             throw new InvalidOperationException($"Free list for order {order} is empty.");
 
-        // Read the "next" pointer from the block's payload area
-        Span<byte> nextBuf = stackalloc byte[8];
-        _file.ReadRaw(address + FormatConstants.BlockHeaderSize, nextBuf);
-        long next = BinaryPrimitives.ReadInt64LittleEndian(nextBuf);
-
-        _freeListHeads[order] = next;
+        // Pop from end for O(1) performance
+        long address = list[^1];
+        list.RemoveAt(list.Count - 1);
         FreeBlockCount--;
         return address;
     }
 
     private void PushFreeBlock(int order, long address)
     {
-        // Write the current head as the "next" pointer in this block's payload area
-        Span<byte> nextBuf = stackalloc byte[8];
-        BinaryPrimitives.WriteInt64LittleEndian(nextBuf, _freeListHeads[order]);
-        _file.WriteRaw(address + FormatConstants.BlockHeaderSize, nextBuf);
-
-        // Mark block as free in header
-        Span<byte> flagBuf = stackalloc byte[1];
-        flagBuf[0] = FormatConstants.BlockFlagFree;
-        _file.WriteRaw(address + 12, flagBuf); // flags at offset 12 in block header
-
-        _freeListHeads[order] = address;
+        _freeLists[order].Add(address);
         FreeBlockCount++;
     }
 
     private bool TryRemoveFromFreeList(int order, long targetAddress)
     {
-        if (_freeListHeads[order] == 0)
-            return false;
+        var list = _freeLists[order];
+        int idx = list.IndexOf(targetAddress);
+        if (idx < 0) return false;
 
-        // Check if head is the target
-        if (_freeListHeads[order] == targetAddress)
-        {
-            PopFreeBlock(order);
-            FreeBlockCount++; // PopFreeBlock decrements, but we don't want net change here
-            _freeListHeads[order] = ReadNextPointer(targetAddress);
-            FreeBlockCount--;
-            return true;
-        }
-
-        // Walk the list to find and remove the target
-        long prev = _freeListHeads[order];
-        long current = ReadNextPointer(prev);
-
-        while (current != 0)
-        {
-            if (current == targetAddress)
-            {
-                long next = ReadNextPointer(current);
-                WriteNextPointer(prev, next);
-                FreeBlockCount--;
-                return true;
-            }
-            prev = current;
-            current = ReadNextPointer(current);
-        }
-
-        return false;
-    }
-
-    private long ReadNextPointer(long blockAddress)
-    {
-        Span<byte> buf = stackalloc byte[8];
-        _file.ReadRaw(blockAddress + FormatConstants.BlockHeaderSize, buf);
-        return BinaryPrimitives.ReadInt64LittleEndian(buf);
-    }
-
-    private void WriteNextPointer(long blockAddress, long next)
-    {
-        Span<byte> buf = stackalloc byte[8];
-        BinaryPrimitives.WriteInt64LittleEndian(buf, next);
-        _file.WriteRaw(blockAddress + FormatConstants.BlockHeaderSize, buf);
+        // Swap with last for O(1) removal
+        list[idx] = list[^1];
+        list.RemoveAt(list.Count - 1);
+        FreeBlockCount--;
+        return true;
     }
 
     private long GrowAndAllocate(int order)
@@ -250,7 +254,8 @@ public sealed class BuddyAllocator
     /// <summary>Resets all free lists to empty (used during recovery rebuild).</summary>
     public void Reset()
     {
-        Array.Clear(_freeListHeads);
+        for (int i = 0; i < FormatConstants.OrderCount; i++)
+            _freeLists[i].Clear();
         FreeBlockCount = 0;
         _dataRegionEnd = FormatConstants.DataRegionOffset;
     }
@@ -264,18 +269,16 @@ public sealed class BuddyAllocator
         _dataRegionEnd = maxAllocated;
 
         // Walk through the data region, identify blocks from the reachable set
-        // and free everything else. We identify block boundaries by reading headers.
+        // and free everything else.
         Span<byte> header = stackalloc byte[4];
         long pos = dataStart;
         while (pos < maxAllocated)
         {
-            // Try to read block size from header
             file.ReadRaw(pos, header);
-            int blockSize = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(header);
+            int blockSize = (int)BinaryPrimitives.ReadUInt32LittleEndian(header);
 
             if (blockSize < FormatConstants.MinBlockSize || blockSize > FormatConstants.MaxBlockSize)
             {
-                // Skip forward by minimum block size if we can't read a valid header
                 pos += FormatConstants.MinBlockSize;
                 continue;
             }
@@ -286,7 +289,6 @@ public sealed class BuddyAllocator
 
             if (!reachableBlocks.Contains(pos))
             {
-                // This block is not reachable — free it (without coalescing for simplicity)
                 PushFreeBlock(order, pos);
             }
 

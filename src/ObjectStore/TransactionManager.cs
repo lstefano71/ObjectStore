@@ -22,26 +22,28 @@ public sealed class TransactionManager
     {
         if (_current == null)
         {
+            var (freeLists, dataEnd, freeCount) = _engine.Allocator.Snapshot();
             _current = new TransactionState
             {
                 Depth = 1,
                 OriginalRootAddress = _engine.Tree.RootAddress,
                 WorkingRootAddress = _engine.Tree.RootAddress,
-                AllocatorSnapshot = _engine.Allocator.SnapshotFreeListHeads(),
-                AllocatorDataRegionEnd = _engine.Allocator.DataRegionEnd,
-                AllocatorFreeBlockCount = _engine.Allocator.FreeBlockCount,
+                AllocatorSnapshot = freeLists,
+                AllocatorDataRegionEnd = dataEnd,
+                AllocatorFreeBlockCount = freeCount,
                 OriginalNextNodeId = _engine.NextNodeId,
             };
         }
         else
         {
             // Nested: push savepoint
+            var (freeLists, dataEnd, freeCount) = _engine.Allocator.Snapshot();
             var sp = new SavepointState
             {
                 RootAddress = _engine.Tree.RootAddress,
-                AllocatorSnapshot = _engine.Allocator.SnapshotFreeListHeads(),
-                AllocatorDataRegionEnd = _engine.Allocator.DataRegionEnd,
-                AllocatorFreeBlockCount = _engine.Allocator.FreeBlockCount,
+                AllocatorSnapshot = freeLists,
+                AllocatorDataRegionEnd = dataEnd,
+                AllocatorFreeBlockCount = freeCount,
                 NewBlocksCount = _current.NewBlocks.Count,
                 PendingFreeCount = _current.PendingFree.Count,
                 NextNodeId = _engine.NextNodeId,
@@ -88,17 +90,13 @@ public sealed class TransactionManager
             var sp = _current.Savepoints.Pop();
             _current.Depth--;
 
-            // Free blocks allocated since savepoint
-            for (int i = _current.NewBlocks.Count - 1; i >= sp.NewBlocksCount; i--)
-            {
-                var (addr, order) = _current.NewBlocks[i];
-                _engine.Allocator.Free(addr, order);
-                _current.NewBlocks.RemoveAt(i);
-            }
-
             // Restore pending-free list
             while (_current.PendingFree.Count > sp.PendingFreeCount)
                 _current.PendingFree.RemoveAt(_current.PendingFree.Count - 1);
+
+            // Trim new blocks list
+            while (_current.NewBlocks.Count > sp.NewBlocksCount)
+                _current.NewBlocks.RemoveAt(_current.NewBlocks.Count - 1);
 
             // Restore allocator and tree state
             _engine.Allocator.RestoreFromSnapshot(sp.AllocatorSnapshot,
@@ -109,11 +107,7 @@ public sealed class TransactionManager
         else
         {
             // Full rollback to beginning of transaction
-            // Free all blocks allocated during this transaction
-            foreach (var (addr, order) in _current.NewBlocks)
-                _engine.Allocator.Free(addr, order);
-
-            // Restore allocator state
+            // Restore allocator state from snapshot (this undoes all allocations)
             _engine.Allocator.RestoreFromSnapshot(_current.AllocatorSnapshot,
                 _current.AllocatorDataRegionEnd, _current.AllocatorFreeBlockCount);
             _engine.RestoreRootAddress(_current.OriginalRootAddress);
