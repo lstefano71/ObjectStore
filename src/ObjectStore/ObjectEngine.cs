@@ -380,6 +380,183 @@ public sealed class ObjectEngine : IDisposable
             yield return NodeRecord.Deserialize(value);
     }
 
+    // --- Hierarchy ---
+
+    private PathResolver? _pathResolver;
+    private PathResolver PathResolver => _pathResolver ??= new PathResolver(this);
+
+    /// <summary>Creates a child node under a given parent.</summary>
+    public ulong CreateChild(ulong parentId, string name, bool isContainer = false)
+    {
+        ThrowIfReadOnly();
+        ulong id = _nextNodeId++;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        byte flags = NodeRecord.FlagHasData;
+        if (isContainer) flags = NodeRecord.FlagHasChildren;
+
+        var record = new NodeRecord
+        {
+            Id = id,
+            ParentId = parentId,
+            NameHash = FnvHash.ComputeString(name),
+            Name = name,
+            NodeTypeFlags = flags,
+            Size = 0,
+            Created = now,
+            Modified = now,
+        };
+
+        var key = new BTreeKey(record.ParentId, record.NameHash);
+        _tree.Insert(key, record.Serialize());
+
+        // Update parent's child count
+        UpdateChildCount(parentId, 1);
+
+        AutoCommit();
+        return id;
+    }
+
+    /// <summary>Moves a node to a new parent (and optionally renames it).</summary>
+    public void MoveNode(ulong nodeId, ulong newParentId, string? newName = null)
+    {
+        ThrowIfReadOnly();
+        var (oldKey, record) = FindById(nodeId);
+        if (record == null) throw new ObjectNotFoundException($"Node {nodeId} not found.");
+
+        // Cycle detection: ensure newParentId is not a descendant of nodeId
+        if (IsDescendantOf(newParentId, nodeId))
+            throw new InvalidOperationException("Cannot move a node into its own subtree.");
+
+        ulong oldParentId = record.ParentId;
+
+        // Remove from old position
+        _tree.Delete(oldKey);
+
+        // Update record
+        record.ParentId = newParentId;
+        if (newName != null)
+        {
+            record.Name = newName;
+            record.NameHash = FnvHash.ComputeString(newName);
+        }
+        record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        // Insert at new position
+        var newKey = new BTreeKey(record.ParentId, record.NameHash);
+        _tree.Insert(newKey, record.Serialize());
+
+        // Update child counts
+        UpdateChildCount(oldParentId, -1);
+        UpdateChildCount(newParentId, 1);
+
+        AutoCommit();
+    }
+
+    /// <summary>Recursively deletes a node and all its descendants.</summary>
+    public void DeleteSubtree(ulong nodeId)
+    {
+        ThrowIfReadOnly();
+        // Recursively collect all descendants
+        var toDelete = new List<(BTreeKey Key, NodeRecord Record)>();
+        CollectSubtree(nodeId, toDelete);
+
+        // Also find the node itself
+        var (nodeKey, nodeRecord) = FindById(nodeId);
+        if (nodeRecord == null) throw new ObjectNotFoundException($"Node {nodeId} not found.");
+
+        ulong parentId = nodeRecord.ParentId;
+
+        // Delete all descendants first
+        foreach (var (key, rec) in toDelete)
+        {
+            FreeNodeData(rec);
+            _tree.Delete(key);
+        }
+
+        // Delete the node itself
+        FreeNodeData(nodeRecord);
+        _tree.Delete(nodeKey);
+
+        // Update parent's child count
+        UpdateChildCount(parentId, -1);
+
+        AutoCommit();
+    }
+
+    /// <summary>Resolves a path to a node ID.</summary>
+    public ulong? ResolvePath(string path) => PathResolver.Resolve(path);
+
+    /// <summary>Lists children of a node.</summary>
+    public IEnumerable<NodeRecord> ListChildren(ulong parentId) => PathResolver.ListChildren(parentId);
+
+    /// <summary>Gets a node by path.</summary>
+    public NodeRecord? GetNodeByPath(string path)
+    {
+        var id = ResolvePath(path);
+        if (id == null) return null;
+        return GetInfo(id.Value);
+    }
+
+    private void UpdateChildCount(ulong parentId, int delta)
+    {
+        if (parentId == 0) return; // no-op for root's parent
+        var (parentKey, parentRecord) = FindById(parentId);
+        if (parentRecord == null) return;
+
+        parentRecord.ChildCount = (uint)Math.Max(0, (int)parentRecord.ChildCount + delta);
+        if (parentRecord.ChildCount > 0)
+            parentRecord.NodeTypeFlags |= NodeRecord.FlagHasChildren;
+        else
+            parentRecord.NodeTypeFlags &= unchecked((byte)~NodeRecord.FlagHasChildren);
+
+        parentRecord.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _tree.Update(parentKey, parentRecord.Serialize());
+    }
+
+    private bool IsDescendantOf(ulong candidateId, ulong ancestorId)
+    {
+        if (candidateId == ancestorId) return true;
+        // Walk up from candidate to root
+        ulong current = candidateId;
+        int maxDepth = 1000; // prevent infinite loops
+        while (current != 0 && current != 1 && maxDepth-- > 0)
+        {
+            var (_, record) = FindById(current);
+            if (record == null) return false;
+            if (record.ParentId == ancestorId) return true;
+            current = record.ParentId;
+        }
+        return false;
+    }
+
+    private void CollectSubtree(ulong nodeId, List<(BTreeKey, NodeRecord)> results)
+    {
+        foreach (var (key, value) in _tree.RangeScan(nodeId))
+        {
+            var record = NodeRecord.Deserialize(value);
+            if (record.IsDeleted) continue;
+            results.Add((key, record));
+            if (record.HasChildren)
+                CollectSubtree(record.Id, results);
+        }
+    }
+
+    private void FreeNodeData(NodeRecord record)
+    {
+        // Free extent data
+        if (record.ExtentListAddress != 0)
+        {
+            var extents = LoadExtentList(record);
+            foreach (var (addr, order) in extents.Extents)
+                DeferredFree(addr, order);
+            DeferredFreeExtentListBlock(record.ExtentListAddress);
+        }
+        // Free metadata
+        if (record.MetadataBlockAddress != 0)
+            DeferredFreeExtentListBlock(record.MetadataBlockAddress);
+    }
+
     // --- Transaction support methods ---
 
     /// <summary>Begins an explicit transaction.</summary>

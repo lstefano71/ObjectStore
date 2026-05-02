@@ -755,3 +755,122 @@ class TestPhase9ReadOnly:
 
         lib.objstore_iter_close(iter_h)
         lib.objstore_close(ro_handle)
+
+
+# ============================================================
+# Phase 10 Tests — Node Hierarchy
+# ============================================================
+
+class TestPhase10Hierarchy:
+    @pytest.fixture(autouse=True)
+    def setup(self, lib, tmp_path):
+        self.lib = lib
+        self.path = str(tmp_path / "phase10_hier.db").encode("utf-8")
+        self.handle = ctypes.c_void_p()
+        rc = lib.objstore_create(self.path, None, ctypes.byref(self.handle))
+        assert rc == 0
+        yield
+        lib.objstore_close(self.handle)
+
+    def test_create_child_and_resolve_path(self):
+        lib = self.lib
+        # Create folder under root (ID=1)
+        folder_id = ctypes.c_uint64()
+        rc = lib.objstore_create_child(self.handle, 1, b"myfolder", 1, ctypes.byref(folder_id))
+        assert rc == 0
+
+        # Resolve path
+        resolved_id = ctypes.c_uint64()
+        rc = lib.objstore_resolve_path(self.handle, b"/myfolder", ctypes.byref(resolved_id))
+        assert rc == 0
+        assert resolved_id.value == folder_id.value
+
+    def test_nested_hierarchy(self):
+        lib = self.lib
+        # Create /parent/child
+        parent_id = ctypes.c_uint64()
+        lib.objstore_create_child(self.handle, 1, b"parent", 1, ctypes.byref(parent_id))
+
+        child_id = ctypes.c_uint64()
+        lib.objstore_create_child(self.handle, parent_id, b"child", 0, ctypes.byref(child_id))
+
+        # Resolve /parent/child
+        resolved = ctypes.c_uint64()
+        rc = lib.objstore_resolve_path(self.handle, b"/parent/child", ctypes.byref(resolved))
+        assert rc == 0
+        assert resolved.value == child_id.value
+
+    def test_list_children(self):
+        lib = self.lib
+        # Create children under root
+        ids = []
+        for name in [b"alpha", b"beta", b"gamma"]:
+            child_id = ctypes.c_uint64()
+            lib.objstore_create_child(self.handle, 1, name, 0, ctypes.byref(child_id))
+            ids.append(child_id.value)
+
+        # List children of root
+        iter_h = ctypes.c_void_p()
+        rc = lib.objstore_list_children_begin(self.handle, 1, ctypes.byref(iter_h))
+        assert rc == 0
+
+        found = []
+        while True:
+            out_id = ctypes.c_uint64()
+            out_size = ctypes.c_int64()
+            rc = lib.objstore_iter_next(iter_h, ctypes.byref(out_id), ctypes.byref(out_size))
+            if rc == 1:
+                break
+            found.append(out_id.value)
+
+        assert sorted(found) == sorted(ids)
+        lib.objstore_iter_close(iter_h)
+
+    def test_move_node(self):
+        lib = self.lib
+        folder1 = ctypes.c_uint64()
+        lib.objstore_create_child(self.handle, 1, b"src", 1, ctypes.byref(folder1))
+        folder2 = ctypes.c_uint64()
+        lib.objstore_create_child(self.handle, 1, b"dst", 1, ctypes.byref(folder2))
+        file_id = ctypes.c_uint64()
+        lib.objstore_create_child(self.handle, folder1, b"file", 0, ctypes.byref(file_id))
+
+        # Move file from src to dst
+        rc = lib.objstore_move_node(self.handle, file_id, folder2, None)
+        assert rc == 0
+
+        # Verify new path
+        resolved = ctypes.c_uint64()
+        rc = lib.objstore_resolve_path(self.handle, b"/dst/file", ctypes.byref(resolved))
+        assert rc == 0
+        assert resolved.value == file_id.value
+
+        # Old path gone
+        rc = lib.objstore_resolve_path(self.handle, b"/src/file", ctypes.byref(resolved))
+        assert rc == -2  # NOT_FOUND
+
+    def test_delete_subtree(self):
+        lib = self.lib
+        folder_id = ctypes.c_uint64()
+        lib.objstore_create_child(self.handle, 1, b"todelete", 1, ctypes.byref(folder_id))
+        child_id = ctypes.c_uint64()
+        lib.objstore_create_child(self.handle, folder_id, b"inner", 0, ctypes.byref(child_id))
+
+        # Delete subtree
+        rc = lib.objstore_delete_subtree(self.handle, folder_id)
+        assert rc == 0
+
+        # Both gone
+        resolved = ctypes.c_uint64()
+        rc = lib.objstore_resolve_path(self.handle, b"/todelete", ctypes.byref(resolved))
+        assert rc == -2
+        exists = ctypes.c_int32()
+        lib.objstore_object_exists(self.handle, child_id, ctypes.byref(exists))
+        assert exists.value == 0
+
+    def test_get_root_id(self):
+        lib = self.lib
+        root_id = ctypes.c_uint64()
+        rc = lib.objstore_get_root_id(self.handle, ctypes.byref(root_id))
+        assert rc == 0
+        assert root_id.value == 1
