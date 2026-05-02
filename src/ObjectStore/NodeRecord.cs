@@ -31,9 +31,8 @@ public sealed class NodeRecord
 
     public byte[] Serialize()
     {
-        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(Name);
-        // Fixed fields: 8+8+8+2+nameLen+1+8+4+8+8+8+8+1+3 = variable
-        int size = 8 + 8 + 8 + 2 + nameBytes.Length + 1 + 8 + 4 + 8 + 8 + 8 + 8 + 1 + 3;
+        int nameByteCount = System.Text.Encoding.UTF8.GetByteCount(Name);
+        int size = 8 + 8 + 8 + 2 + nameByteCount + 1 + 8 + 4 + 8 + 8 + 8 + 8 + 1 + 3;
         byte[] data = new byte[size];
         var span = data.AsSpan();
         int offset = 0;
@@ -41,8 +40,8 @@ public sealed class NodeRecord
         BinaryPrimitives.WriteUInt64LittleEndian(span[offset..], Id); offset += 8;
         BinaryPrimitives.WriteUInt64LittleEndian(span[offset..], ParentId); offset += 8;
         BinaryPrimitives.WriteUInt64LittleEndian(span[offset..], NameHash); offset += 8;
-        BinaryPrimitives.WriteUInt16LittleEndian(span[offset..], (ushort)nameBytes.Length); offset += 2;
-        nameBytes.CopyTo(span[offset..]); offset += nameBytes.Length;
+        BinaryPrimitives.WriteUInt16LittleEndian(span[offset..], (ushort)nameByteCount); offset += 2;
+        System.Text.Encoding.UTF8.GetBytes(Name, span.Slice(offset, nameByteCount)); offset += nameByteCount;
         span[offset++] = NodeTypeFlags;
         BinaryPrimitives.WriteInt64LittleEndian(span[offset..], Size); offset += 8;
         BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], ChildCount); offset += 4;

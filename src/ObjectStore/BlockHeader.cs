@@ -43,6 +43,16 @@ public static class BlockHeader
     /// </summary>
     public static void ValidateAndGetPayload(ReadOnlySpan<byte> raw, out byte[] payload)
     {
+        int payloadSize = Validate(raw);
+        payload = raw.Slice(FormatConstants.BlockHeaderSize, payloadSize).ToArray();
+    }
+
+    /// <summary>
+    /// Validates a block's checksum in-place without allocating.
+    /// Returns the payload size. The payload starts at offset BlockHeaderSize in the raw buffer.
+    /// </summary>
+    public static int Validate(ReadOnlySpan<byte> raw)
+    {
         if (raw.Length < FormatConstants.BlockHeaderSize)
             throw new BlockCorruptedException(0, "Block too small for header.");
 
@@ -60,7 +70,7 @@ public static class BlockHeader
             throw new BlockCorruptedException(0,
                 $"Block checksum mismatch: expected 0x{storedChecksum:X16}, got 0x{actualChecksum:X16}");
 
-        payload = payloadArea.ToArray();
+        return payloadSize;
     }
 
     /// <summary>Reads the flags byte from a block header.</summary>

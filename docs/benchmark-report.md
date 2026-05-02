@@ -227,12 +227,14 @@ Batching 100 operations in a single transaction reduces per-object cost from 3.3
 - Large reads: **108 μs** (limited by extent list traversal + multi-block copy)
 - Reads scale linearly across processes (no lock contention)
 
-### 7.4 Memory Allocation
+### 7.4 Memory Allocation (After Optimization)
 
-- Write operations allocate 230–710 KB per operation (COW serialization buffers, B-tree nodes)
-- Read operations allocate 33–161 KB (primarily the read buffer)
-- Transaction batches allocate ~345 KB/object (cumulative B-tree COW nodes)
-- GC pressure is moderate; Gen2 collections occur during large batches
+- Write operations allocate 69–275 KB per operation (down from 230–710 KB — **63-74% reduction**)
+- Read operations allocate 1.1 KB (down from 33 KB — **97% reduction**)
+- Transaction batches allocate ~126 KB/object (down from ~345 KB — **63% reduction**)
+- GC pressure significantly reduced; Gen0/Gen1 collections cut by ~60%
+
+See Section 9 for the full before/after comparison.
 
 ### 7.5 Multi-Process Scaling
 
@@ -273,4 +275,66 @@ Batching 100 operations in a single transaction reduces per-object cost from 3.3
 
 ---
 
-*Report generated from benchmark runs on 2026-05-02. Results may vary with OS caching state, background processes, and thermal throttling.*
+*Report generated from benchmark runs on 2026-05-02. Updated 2026-05-02 with memory optimization results.*
+
+---
+
+## 9. Memory Optimization: Before/After Comparison
+
+**Date:** 2026-05-02  
+**Changes:** Eliminated ReadBlock cloning, pooled WriteBlock buffers with ArrayPool, rewrote BTreeNode.Serialize with BinaryPrimitives (no MemoryStream), optimized NodeRecord.Serialize to encode UTF8 directly.
+
+### 9.1 Single-Process Allocation (BenchmarkDotNet, SSD)
+
+| Method | Before (Alloc) | After (Alloc) | Reduction | Before (Time) | After (Time) |
+|--------|---------------:|--------------:|----------:|---------------:|-------------:|
+| CreateObject | 351 KB | **96.56 KB** | 72% | 3,257 μs | 2,890 μs |
+| AppendSmall (100B) | 440 KB | **113.62 KB** | 74% | 2,705 μs | 2,252 μs |
+| AppendLarge (64KB) | 711 KB | **273.36 KB** | 62% | 3,480 μs | 3,408 μs |
+| ReadSmall (100B) | 33 KB | **1.13 KB** | 97% | 8.1 μs | 4.4 μs |
+| ReadLarge (64KB) | 161 KB | **1.13 KB** | 99% | 108.0 μs | 7.0 μs |
+| WriteAtMiddle | 468 KB | **274.8 KB** | 41% | 3,319 μs | 3,373 μs |
+| DeleteObject | 232 KB | **69.02 KB** | 70% | 4,733 μs | 4,602 μs |
+| MetadataSetGet | 117 KB | **20.51 KB** | 82% | 2,123 μs | 2,304 μs |
+
+### 9.2 Transaction Batch Allocation (BenchmarkDotNet, SSD)
+
+| Batch Size | Before (Alloc) | After (Alloc) | Reduction | Before (Time) | After (Time) |
+|-----------:|---------------:|--------------:|----------:|---------------:|-------------:|
+| 10 | 3.4 MB | **1.25 MB** | 63% | 11.6 ms | 10.4 ms |
+| 100 | 34.4 MB | **12.56 MB** | 63% | 79.4 ms | 64.8 ms |
+| 1000 | 345 MB | **126.22 MB** | 63% | 787 ms | 455 ms |
+
+### 9.3 Multi-Process Throughput Comparison (Python, SSD)
+
+| Scenario | Before (ops/s) | After (ops/s) | Change |
+|----------|---------------:|--------------:|-------:|
+| Sequential Write (256B) | 174 | **186** | +7% |
+| Sequential Write (64KB) | 126 | **181** | +44% |
+| Sequential Read (256B) | 27,925 | **63,460** | +127% |
+| Sequential Read (64KB) | 9,906 | **47,610** | +381% |
+| Transaction Batch (200×256B) | 787 | **1,136** | +44% |
+| Concurrent Write 4 workers | 142 | **144** | +1% |
+| Concurrent Read 4 readers | 7,830 | **7,966** | +2% |
+| Concurrent Read 8 readers | 9,018 | **10,867** | +21% |
+| Large Object Write (1MB) | 69 | **62** | -10% |
+| Large Object Read (1MB) | 618 | **7,546** | +1121% |
+
+### 9.4 Analysis of Improvements
+
+**Allocation reductions (primary goal):**
+- **Reads:** Returning the shared cache reference instead of cloning eliminated ~99% of read allocation. The 1.13 KB remaining is just the managed object overhead.
+- **Writes:** Pooling the WriteBlock buffer and eliminating MemoryStream in BTreeNode.Serialize cut write allocations by 62-74%.
+- **Transaction batches:** Per-object allocation dropped from ~345 KB to ~126 KB (63% reduction), meaning a 1000-object batch went from 345 MB to 126 MB of GC pressure.
+
+**Performance improvements (secondary benefit):**
+- **Reads improved dramatically** — 46% faster for in-process (8μs→4.4μs), and up to 12× faster via FFI for large objects (cache hit path is now nearly zero-copy).
+- **Transaction batches 42% faster** for 1000-object batches (less GC pressure = fewer Gen2 collections).
+- **Write latency unchanged** — still dominated by fsync, as expected. The ~200 KB allocation saving doesn't materially affect the 3ms+ commit time.
+
+**Techniques applied:**
+1. `ReadBlock` returns shared cache reference (no `byte[].Clone()`)
+2. `ReadBlockMutable` for the 2 COW paths that need to mutate the buffer
+3. `WriteBlock` rents raw buffer from `ArrayPool<byte>.Shared`
+4. `BTreeNode.Serialize` pre-calculates size, writes directly via `BinaryPrimitives`
+5. `NodeRecord.Serialize` uses `UTF8.GetByteCount` + `UTF8.GetBytes(name, span)` directly

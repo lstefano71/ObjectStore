@@ -315,7 +315,7 @@ public sealed class ObjectEngine : IDisposable
                 if (spaceInLast > 0)
                 {
                     int toFill = Math.Min(remaining, spaceInLast);
-                    byte[] blockData = _file.ReadBlock(lastAddr, lastOrder);
+                    byte[] blockData = _file.ReadBlockMutable(lastAddr, lastOrder);
                     data.Slice(dataOffset, toFill).CopyTo(blockData.AsSpan(lastBlockUsed));
 
                     // COW: allocate new block, write merged data, free old
@@ -428,7 +428,7 @@ public sealed class ObjectEngine : IDisposable
                     if (toWrite > 0)
                     {
                         // COW: read old block, modify, write to new block
-                        byte[] blockData = _file.ReadBlock(addr, order);
+                        byte[] blockData = _file.ReadBlockMutable(addr, order);
                         data.Slice(srcStart, toWrite).CopyTo(blockData.AsSpan(skipInExtent));
 
                         long newAddr = AllocateTracked(order);

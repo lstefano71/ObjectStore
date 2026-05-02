@@ -77,19 +77,40 @@ public sealed class ContainerFile : IDisposable
     /// <summary>
     /// Reads a block at the given address. Uses cache if available.
     /// Validates the block header checksum. Returns the payload (without header).
+    /// WARNING: The returned array may be shared with the cache — do NOT mutate it.
+    /// Use ReadBlockMutable if you need to modify the data.
     /// </summary>
     public byte[] ReadBlock(long address, int order)
     {
         if (_blockCache != null && _blockCache.TryGet(address, out var cached))
-            return (byte[])cached!.Clone(); // Return a copy to prevent mutation of cache
+            return cached!;
 
         int blockSize = FormatConstants.BlockSizeForOrder(order);
-        byte[] raw = new byte[blockSize];
-        ReadRaw(address, raw);
-        BlockHeader.ValidateAndGetPayload(raw, out var payload);
+        byte[] raw = System.Buffers.ArrayPool<byte>.Shared.Rent(blockSize);
+        try
+        {
+            ReadRaw(address, raw.AsSpan(0, blockSize));
+            int payloadSize = BlockHeader.Validate(raw.AsSpan(0, blockSize));
+            byte[] payload = new byte[payloadSize];
+            raw.AsSpan(FormatConstants.BlockHeaderSize, payloadSize).CopyTo(payload);
 
-        _blockCache?.Put(address, payload);
-        return (byte[])payload.Clone();
+            _blockCache?.Put(address, payload);
+            return payload;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(raw);
+        }
+    }
+
+    /// <summary>
+    /// Reads a block and returns a mutable copy (not shared with cache).
+    /// Use this when you need to modify the data (e.g., COW append/write-at).
+    /// </summary>
+    public byte[] ReadBlockMutable(long address, int order)
+    {
+        byte[] shared = ReadBlock(address, order);
+        return (byte[])shared.Clone();
     }
 
     /// <summary>
@@ -104,9 +125,16 @@ public sealed class ContainerFile : IDisposable
         if (payload.Length > payloadCapacity)
             throw new ArgumentException($"Payload ({payload.Length}) exceeds block capacity ({payloadCapacity}).");
 
-        byte[] raw = new byte[blockSize];
-        BlockHeader.WriteBlock(raw, payload, flags);
-        WriteRaw(address, raw);
+        byte[] raw = System.Buffers.ArrayPool<byte>.Shared.Rent(blockSize);
+        try
+        {
+            BlockHeader.WriteBlock(raw.AsSpan(0, blockSize), payload, flags);
+            WriteRaw(address, raw.AsSpan(0, blockSize));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(raw);
+        }
 
         // Cache the full payload area (zero-padded) to match what ReadBlock returns
         if (_blockCache != null)

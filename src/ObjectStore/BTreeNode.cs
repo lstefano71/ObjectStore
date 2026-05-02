@@ -39,19 +39,35 @@ public sealed class BTreeNode
     /// </summary>
     public byte[] Serialize()
     {
-        using var ms = new MemoryStream();
-        using var writer = new BinaryWriter(ms);
+        // Pre-calculate total size
+        int size = 4; // header: nodeType(1) + keyCount(2) + reserved(1)
+        size += Keys.Count * BTreeKey.Size;
 
-        writer.Write(NodeType);
-        writer.Write((ushort)Keys.Count);
-        writer.Write((byte)0); // reserved
+        if (IsLeaf)
+        {
+            foreach (var value in Values)
+                size += 2 + value.Length; // u16 length prefix + data
+        }
+        else
+        {
+            size += (Keys.Count + 1) * 8; // child pointers
+        }
+
+        byte[] buffer = new byte[size];
+        var span = buffer.AsSpan();
+        int offset = 0;
+
+        // Header
+        span[offset++] = NodeType;
+        BinaryPrimitives.WriteUInt16LittleEndian(span[offset..], (ushort)Keys.Count);
+        offset += 2;
+        span[offset++] = 0; // reserved
 
         // Keys
-        Span<byte> keyBuf = stackalloc byte[BTreeKey.Size];
         foreach (var key in Keys)
         {
-            key.WriteTo(keyBuf);
-            writer.Write(keyBuf);
+            key.WriteTo(span.Slice(offset, BTreeKey.Size));
+            offset += BTreeKey.Size;
         }
 
         if (IsLeaf)
@@ -59,8 +75,10 @@ public sealed class BTreeNode
             // Values: length-prefixed byte arrays
             foreach (var value in Values)
             {
-                writer.Write((ushort)value.Length);
-                writer.Write(value);
+                BinaryPrimitives.WriteUInt16LittleEndian(span[offset..], (ushort)value.Length);
+                offset += 2;
+                value.CopyTo(span[offset..]);
+                offset += value.Length;
             }
         }
         else
@@ -68,11 +86,12 @@ public sealed class BTreeNode
             // Children: (keyCount + 1) × u64
             foreach (var child in Children)
             {
-                writer.Write(child);
+                BinaryPrimitives.WriteInt64LittleEndian(span[offset..], child);
+                offset += 8;
             }
         }
 
-        return ms.ToArray();
+        return buffer;
     }
 
     /// <summary>
