@@ -64,3 +64,57 @@ class TestPhase1Version:
         major = ctypes.c_int32()
         rc = lib.objstore_get_version(None, ctypes.byref(major))
         assert rc == -5  # OBJSTORE_ERR_INVALID_ARG
+
+
+# ============================================================
+# Phase 2 Tests — Options Handle
+# ============================================================
+
+class TestPhase2Options:
+    def test_options_create_and_free(self, lib):
+        opts = ctypes.c_void_p()
+        rc = lib.objstore_options_create(ctypes.byref(opts))
+        assert rc == 0
+        assert opts.value is not None
+
+        lib.objstore_options_free(opts)
+
+    def test_options_set_read_only(self, lib):
+        opts = ctypes.c_void_p()
+        lib.objstore_options_create(ctypes.byref(opts))
+
+        rc = lib.objstore_options_set_read_only(opts, 1)
+        assert rc == 0
+
+        lib.objstore_options_free(opts)
+
+    def test_options_set_shared_access(self, lib):
+        opts = ctypes.c_void_p()
+        lib.objstore_options_create(ctypes.byref(opts))
+
+        rc = lib.objstore_options_set_shared_access(opts, 1)
+        assert rc == 0
+
+        lib.objstore_options_free(opts)
+
+    def test_options_set_cache_max_bytes(self, lib):
+        opts = ctypes.c_void_p()
+        lib.objstore_options_create(ctypes.byref(opts))
+
+        rc = lib.objstore_options_set_cache_max_bytes(opts, 64 * 1024 * 1024)
+        assert rc == 0
+
+        lib.objstore_options_free(opts)
+
+    def test_options_set_lock_timeout(self, lib):
+        opts = ctypes.c_void_p()
+        lib.objstore_options_create(ctypes.byref(opts))
+
+        rc = lib.objstore_options_set_lock_timeout_ms(opts, 5000)
+        assert rc == 0
+
+        lib.objstore_options_free(opts)
+
+    def test_options_invalid_handle(self, lib):
+        rc = lib.objstore_options_set_read_only(ctypes.c_void_p(0), 1)
+        assert rc == -5  # OBJSTORE_ERR_INVALID_ARG
