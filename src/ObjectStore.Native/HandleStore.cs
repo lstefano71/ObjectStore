@@ -38,4 +38,5 @@ public sealed class NativeOptions
     public long CacheMaxBytes { get; set; } = 32 * 1024 * 1024;
     public int LockTimeoutMs { get; set; } = 30_000;
     public byte[]? EncryptionKey { get; set; }
+    public byte CompressionCodec { get; set; } // 0=None, 1=Deflate, 2=Brotli
 }

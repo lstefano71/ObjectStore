@@ -120,6 +120,24 @@ public static partial class NativeExports
         }
     }
 
+    [UnmanagedCallersOnly(EntryPoint = "objstore_options_set_compression")]
+    public static int OptionsSetCompression(IntPtr opts, int codec)
+    {
+        try
+        {
+            var o = HandleStore.Get<NativeOptions>(opts);
+            if (o == null) return NativeErrorCodes.InvalidArg;
+            if (codec < 0 || codec > 2) return NativeErrorCodes.InvalidArg;
+            o.CompressionCodec = (byte)codec;
+            NativeErrorHelper.ClearLastError();
+            return NativeErrorCodes.Ok;
+        }
+        catch (Exception ex)
+        {
+            return NativeErrorHelper.Capture(ex);
+        }
+    }
+
     [UnmanagedCallersOnly(EntryPoint = "objstore_options_free")]
     public static void OptionsFree(IntPtr opts)
     {

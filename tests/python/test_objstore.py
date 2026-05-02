@@ -5,6 +5,9 @@ This file grows incrementally with each implementation phase.
 Phase 1: objstore_get_version
 Phase 2: options handle
 Phase 3: store lifecycle + object CRUD + read/write
+Phase 4: transactions
+Phase 5: SIEVE cache (transparent, tested via workload)
+Phase 6: compression & encryption options
 """
 import ctypes
 import os
@@ -406,3 +409,49 @@ class TestPhase4Transactions:
         exists2 = ctypes.c_int32()
         lib.objstore_object_exists(self.handle, obj_id2, ctypes.byref(exists2))
         assert exists2.value == 0
+
+
+# ============================================================
+# Phase 6 Tests — Compression & Encryption Options
+# ============================================================
+
+class TestPhase6Options:
+    def test_set_compression_deflate(self, lib):
+        opts = ctypes.c_void_p()
+        lib.objstore_options_create(ctypes.byref(opts))
+        rc = lib.objstore_options_set_compression(opts, 1)  # Deflate
+        assert rc == 0
+        lib.objstore_options_free(opts)
+
+    def test_set_compression_brotli(self, lib):
+        opts = ctypes.c_void_p()
+        lib.objstore_options_create(ctypes.byref(opts))
+        rc = lib.objstore_options_set_compression(opts, 2)  # Brotli
+        assert rc == 0
+        lib.objstore_options_free(opts)
+
+    def test_set_compression_invalid(self, lib):
+        opts = ctypes.c_void_p()
+        lib.objstore_options_create(ctypes.byref(opts))
+        rc = lib.objstore_options_set_compression(opts, 99)
+        assert rc == -5  # INVALID_ARG
+        lib.objstore_options_free(opts)
+
+    def test_set_encryption_key(self, lib):
+        opts = ctypes.c_void_p()
+        lib.objstore_options_create(ctypes.byref(opts))
+        key = bytes(range(32))  # 32-byte key
+        rc = lib.objstore_options_set_encryption_key(opts, key, len(key))
+        assert rc == 0
+        lib.objstore_options_free(opts)
+
+    def test_clear_encryption_key(self, lib):
+        opts = ctypes.c_void_p()
+        lib.objstore_options_create(ctypes.byref(opts))
+        # Set a key
+        key = bytes(range(32))
+        lib.objstore_options_set_encryption_key(opts, key, len(key))
+        # Clear it
+        rc = lib.objstore_options_set_encryption_key(opts, None, 0)
+        assert rc == 0
+        lib.objstore_options_free(opts)
