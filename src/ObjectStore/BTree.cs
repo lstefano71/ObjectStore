@@ -23,6 +23,12 @@ public sealed class BTree
     /// <summary>Tracks block addresses allocated by this tree in the current batch/transaction, with their order.</summary>
     private Dictionary<long, int>? _batchOwnedBlocks;
 
+    /// <summary>
+    /// During batch mode, holds modified nodes that haven't been serialized to disk yet.
+    /// Avoids redundant serialization when the same node is modified multiple times in a batch.
+    /// </summary>
+    private Dictionary<long, BTreeNode>? _dirtyNodes;
+
     private const int DefaultOrder = 32;
     private const int DefaultNodeBlockOrder = 8; // 16KB — historical default, now nodes are dynamically sized
 
@@ -40,12 +46,90 @@ public sealed class BTree
     public void BeginBatchMode()
     {
         _batchOwnedBlocks = new Dictionary<long, int>();
+        _dirtyNodes = new Dictionary<long, BTreeNode>();
     }
 
-    /// <summary>Ends batch mode and clears the owned-block tracking set.</summary>
+    /// <summary>Ends batch mode: flushes all dirty nodes to disk and clears tracking.</summary>
     public void EndBatchMode()
     {
+        if (_dirtyNodes != null && _dirtyNodes.Count > 0)
+            FlushDirtyNodes();
         _batchOwnedBlocks = null;
+        _dirtyNodes = null;
+    }
+
+    /// <summary>
+    /// Serializes and writes all dirty nodes. If a node outgrew its allocated block,
+    /// allocates a new larger block and updates all parent references.
+    /// </summary>
+    private void FlushDirtyNodes()
+    {
+        if (_dirtyNodes == null || _batchOwnedBlocks == null) return;
+
+        // We may need multiple passes if a node moves (parent references change).
+        // Collect address relocations and fix up parent.Children entries.
+        var relocations = new Dictionary<long, long>(); // old → new
+
+        foreach (var (address, node) in _dirtyNodes)
+        {
+            byte[] data = node.Serialize();
+            int newOrder = FormatConstants.OrderForPayload(data.Length);
+
+            if (_batchOwnedBlocks.TryGetValue(address, out int oldOrder) && newOrder <= oldOrder)
+            {
+                // Fits in current block — write in place
+                _file.WriteBlockOwned(address, oldOrder, data);
+            }
+            else
+            {
+                // Outgrew block — allocate new, free old
+                if (_batchOwnedBlocks.TryGetValue(address, out int curOrder))
+                {
+                    _batchOwnedBlocks.Remove(address);
+                    _allocator.Free(address, curOrder);
+                }
+                long newAddr = _allocator.Allocate(newOrder);
+                _file.WriteBlockOwned(newAddr, newOrder, data);
+                _batchOwnedBlocks[newAddr] = newOrder;
+                node.Address = newAddr;
+                relocations[address] = newAddr;
+            }
+        }
+
+        // Fix up child pointers in dirty nodes if any children relocated
+        if (relocations.Count > 0)
+        {
+            foreach (var (_, node) in _dirtyNodes)
+            {
+                if (node.IsLeaf) continue;
+                for (int i = 0; i < node.Children.Count; i++)
+                {
+                    if (relocations.TryGetValue(node.Children[i], out long newAddr))
+                        node.Children[i] = newAddr;
+                }
+            }
+            // Re-serialize relocated parents (they may have been already written with old refs)
+            foreach (var (_, node) in _dirtyNodes)
+            {
+                if (node.IsLeaf || node.Address == 0) continue;
+                bool hasRelocatedChild = false;
+                for (int i = 0; i < node.Children.Count; i++)
+                {
+                    if (relocations.ContainsValue(node.Children[i]))
+                    { hasRelocatedChild = true; break; }
+                }
+                if (hasRelocatedChild)
+                {
+                    byte[] data = node.Serialize();
+                    int order = FormatConstants.OrderForPayload(data.Length);
+                    if (_batchOwnedBlocks.TryGetValue(node.Address, out int curOrd) && order <= curOrd)
+                        _file.WriteBlockOwned(node.Address, curOrd, data);
+                }
+            }
+            // Update root if relocated
+            if (relocations.TryGetValue(RootAddress, out long newRoot))
+                RootAddress = newRoot;
+        }
     }
 
     public byte[]? Get(BTreeKey key)
@@ -150,6 +234,8 @@ public sealed class BTree
 
     private BTreeNode ReadNode(long address)
     {
+        if (_dirtyNodes != null && _dirtyNodes.TryGetValue(address, out var dirty))
+            return dirty;
         byte[] data = _file.ReadBlockAutoPayload(address);
         return BTreeNode.Deserialize(data);
     }
@@ -162,17 +248,28 @@ public sealed class BTree
         _file.WriteBlockOwned(address, order, data);
         node.Address = address;
         _batchOwnedBlocks?.TryAdd(address, order);
+        // Track in dirty nodes so ReadNode finds it without deserialization
+        _dirtyNodes?.TryAdd(address, node);
         return address;
     }
 
     /// <summary>
     /// Writes a modified node, reusing its old address if it was allocated in the current batch.
+    /// In batch mode with dirty-node tracking, defers serialization entirely.
     /// Otherwise performs normal COW (allocate new, track old for freeing).
     /// </summary>
     private long WriteNodeReplace(BTreeNode node, long oldAddress)
     {
         if (_batchOwnedBlocks != null && _batchOwnedBlocks.TryGetValue(oldAddress, out int oldOrder))
         {
+            // Batch-owned: defer serialization — just mark dirty
+            if (_dirtyNodes != null)
+            {
+                node.Address = oldAddress;
+                _dirtyNodes[oldAddress] = node;
+                return oldAddress;
+            }
+
             byte[] data = node.Serialize();
             int newOrder = FormatConstants.OrderForPayload(data.Length);
 
@@ -205,8 +302,28 @@ public sealed class BTree
 
     private byte[]? SearchLeaf(long address, BTreeKey key)
     {
+        // If the node is dirty (modified in this batch), search it in-memory
+        if (_dirtyNodes != null && _dirtyNodes.TryGetValue(address, out var dirtyNode))
+            return SearchNodeInMemory(dirtyNode, key);
         byte[] data = _file.ReadBlockAutoPayload(address);
         return SearchLeafDirect(data, key);
+    }
+
+    /// <summary>Searches for a key in an in-memory BTreeNode (used for dirty nodes).</summary>
+    private byte[]? SearchNodeInMemory(BTreeNode node, BTreeKey key)
+    {
+        if (node.IsLeaf)
+        {
+            int i = FindKeyIndex(node, key);
+            if (i < node.KeyCount && node.Keys[i] == key)
+                return node.Values[i];
+            return null;
+        }
+        else
+        {
+            int childIdx = FindChildIndex(node, key);
+            return SearchLeaf(node.Children[childIdx], key);
+        }
     }
 
     /// <summary>
@@ -268,9 +385,8 @@ public sealed class BTree
             long childAddr = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(
                 data[(childrenStart + childIdx * 8)..]);
 
-            // Read next node and recurse
-            byte[] childData = _file.ReadBlockAutoPayload(childAddr);
-            return SearchLeafDirect(childData, key);
+            // Child might be dirty — use SearchLeaf which checks dirty nodes
+            return SearchLeaf(childAddr, key);
         }
     }
 

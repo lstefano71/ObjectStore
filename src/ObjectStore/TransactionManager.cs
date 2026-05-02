@@ -36,6 +36,7 @@ public sealed class TransactionManager
             };
             _engine.Tree.BeginBatchMode();
             _engine.IdTree.BeginBatchMode();
+            _engine.File.BeginBufferedWrites();
         }
         else
         {
@@ -78,9 +79,11 @@ public sealed class TransactionManager
         }
         else
         {
-            // Top-level commit: end batch mode before persisting
+            // Top-level commit: end batch mode, flush buffered writes, then persist
             _engine.Tree.EndBatchMode();
             _engine.IdTree.EndBatchMode();
+            _engine.File.DrainBufferedWrites();
+            _engine.File.EndBufferedWrites();
 
             _engine.CommitInternal();
 
@@ -130,6 +133,8 @@ public sealed class TransactionManager
             // Full rollback to beginning of transaction — end batch mode
             _engine.Tree.EndBatchMode();
             _engine.IdTree.EndBatchMode();
+            _engine.File.DiscardBufferedWrites();
+            _engine.File.EndBufferedWrites();
 
             _engine.Allocator.RestoreFromSnapshot(_current.AllocatorSnapshot,
                 _current.AllocatorDataRegionEnd, _current.AllocatorFreeBlockCount);

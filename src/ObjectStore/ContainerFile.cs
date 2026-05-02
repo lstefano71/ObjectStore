@@ -15,9 +15,16 @@ public sealed class ContainerFile : IDisposable
     private const long LinearGrowthIncrement = 64 * 1024 * 1024;
     private const int DefaultCacheCapacity = 1024; // default block cache entries
 
+    /// <summary>
+    /// When non-null, block writes are buffered in memory instead of going to disk.
+    /// Flushed to disk as a batch at commit time for dramatically lower I/O during transactions.
+    /// </summary>
+    private Dictionary<long, (byte[] Raw, int BlockSize)>? _pendingWrites;
+
     public long FileSize => _fileSize;
     public string Path { get; }
     public SieveCache<long, byte[]>? BlockCache => _blockCache;
+    public bool IsBufferingWrites => _pendingWrites != null;
 
     private ContainerFile(FileStream stream, string path)
     {
@@ -206,15 +213,16 @@ public sealed class ContainerFile : IDisposable
         if (payload.Length > payloadCapacity)
             throw new ArgumentException($"Payload ({payload.Length}) exceeds block capacity ({payloadCapacity}).");
 
-        byte[] raw = System.Buffers.ArrayPool<byte>.Shared.Rent(blockSize);
-        try
+        byte[] raw = new byte[blockSize];
+        BlockHeader.WriteBlock(raw.AsSpan(0, blockSize), payload, flags);
+
+        if (_pendingWrites != null)
         {
-            BlockHeader.WriteBlock(raw.AsSpan(0, blockSize), payload, flags);
-            WriteRaw(address, raw.AsSpan(0, blockSize));
+            _pendingWrites[address] = (raw, blockSize);
         }
-        finally
+        else
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(raw);
+            WriteRaw(address, raw.AsSpan(0, blockSize));
         }
 
         // Cache the actual payload (not the full block capacity — ReadBlock does the same)
@@ -238,15 +246,16 @@ public sealed class ContainerFile : IDisposable
         if (ownedPayload.Length > payloadCapacity)
             throw new ArgumentException($"Payload ({ownedPayload.Length}) exceeds block capacity ({payloadCapacity}).");
 
-        byte[] raw = System.Buffers.ArrayPool<byte>.Shared.Rent(blockSize);
-        try
+        byte[] raw = new byte[blockSize];
+        BlockHeader.WriteBlock(raw.AsSpan(0, blockSize), ownedPayload, flags);
+
+        if (_pendingWrites != null)
         {
-            BlockHeader.WriteBlock(raw.AsSpan(0, blockSize), ownedPayload, flags);
-            WriteRaw(address, raw.AsSpan(0, blockSize));
+            _pendingWrites[address] = (raw, blockSize);
         }
-        finally
+        else
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(raw);
+            WriteRaw(address, raw.AsSpan(0, blockSize));
         }
 
         _blockCache?.Put(address, ownedPayload);
@@ -278,6 +287,49 @@ public sealed class ContainerFile : IDisposable
     public void Flush()
     {
         _stream.Flush(flushToDisk: true);
+    }
+
+    /// <summary>Begins buffering block writes in memory instead of writing to disk.</summary>
+    public void BeginBufferedWrites()
+    {
+        _pendingWrites ??= new Dictionary<long, (byte[] Raw, int BlockSize)>();
+    }
+
+    /// <summary>
+    /// Writes all pending buffered blocks to disk. Does NOT flush to disk (caller does that).
+    /// </summary>
+    public void DrainBufferedWrites()
+    {
+        if (_pendingWrites == null || _pendingWrites.Count == 0) return;
+        foreach (var (address, (raw, blockSize)) in _pendingWrites)
+        {
+            long needed = address + blockSize;
+            if (needed > _fileSize) GrowTo(needed);
+            _stream.Seek(address, SeekOrigin.Begin);
+            _stream.Write(raw.AsSpan(0, blockSize));
+        }
+        _pendingWrites.Clear();
+    }
+
+    /// <summary>Discards all buffered writes (used on transaction rollback).</summary>
+    public void DiscardBufferedWrites()
+    {
+        if (_pendingWrites != null)
+        {
+            // Invalidate cache entries for discarded writes
+            if (_blockCache != null)
+            {
+                foreach (var addr in _pendingWrites.Keys)
+                    _blockCache.Invalidate(addr);
+            }
+            _pendingWrites.Clear();
+        }
+    }
+
+    /// <summary>Ends write buffering mode.</summary>
+    public void EndBufferedWrites()
+    {
+        _pendingWrites = null;
     }
 
     // Lock sentinel offset — far beyond any real file data to avoid blocking reads.
