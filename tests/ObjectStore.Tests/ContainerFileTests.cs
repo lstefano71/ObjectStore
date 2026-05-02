@@ -79,6 +79,9 @@ public class ContainerFileTests : IDisposable
         byte[] corrupt = [0xFF];
         file.WriteRaw(address + FormatConstants.BlockHeaderSize + 1, corrupt);
 
+        // Invalidate cache to force re-read from disk
+        file.InvalidateBlock(address);
+
         Assert.Throws<BlockCorruptedException>(() => file.ReadBlock(address, 0));
     }
 
