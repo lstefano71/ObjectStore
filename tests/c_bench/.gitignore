@@ -6,3 +6,4 @@ sqlite3ext.h
 *.pdb
 sqlite-amalgamation.zip
 
+*.dll
