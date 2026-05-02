@@ -176,6 +176,15 @@ public sealed class ContainerFile : IDisposable
     /// </summary>
     public byte[] ReadBlockAutoPayload(long address)
     {
+        // Check pending writes first (buffered during transaction)
+        if (_pendingWrites != null && _pendingWrites.TryGetValue(address, out var pending))
+        {
+            int payloadSize = BlockHeader.Validate(pending.Raw.AsSpan(0, pending.BlockSize));
+            byte[] payload = new byte[payloadSize];
+            pending.Raw.AsSpan(FormatConstants.BlockHeaderSize, payloadSize).CopyTo(payload);
+            return payload;
+        }
+
         if (_blockCache != null && _blockCache.TryGet(address, out var cached))
             return cached!;
 
@@ -301,7 +310,9 @@ public sealed class ContainerFile : IDisposable
     public void DrainBufferedWrites()
     {
         if (_pendingWrites == null || _pendingWrites.Count == 0) return;
-        foreach (var (address, (raw, blockSize)) in _pendingWrites)
+        // Sort by address for sequential I/O (helps on HDD, reduces seeks)
+        var sorted = _pendingWrites.OrderBy(kv => kv.Key);
+        foreach (var (address, (raw, blockSize)) in sorted)
         {
             long needed = address + blockSize;
             if (needed > _fileSize) GrowTo(needed);

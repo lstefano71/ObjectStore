@@ -252,6 +252,9 @@ public sealed class ObjectEngine : IDisposable
             var idKey = new BTreeKey(0, id);
             _idTree.Insert(idKey, key.Serialize());
 
+            // Cache the newly-created object for fast FindById in subsequent Append
+            IdCachePut(id, key, record);
+
             AutoCommit();
             return id;
         }
