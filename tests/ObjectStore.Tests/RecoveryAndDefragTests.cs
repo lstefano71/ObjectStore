@@ -104,12 +104,12 @@ public class RecoveryAndDefragTests : IDisposable
     {
         using var db = ObjectStoreDatabase.Create(_path);
 
-        // Create objects with interleaved allocation
+        // Create objects with interleaved allocation (use size > inline threshold to ensure extent-based storage)
         var ids = new List<ulong>();
         for (int i = 0; i < 5; i++)
         {
             var id = db.CreateObject($"frag{i}");
-            db.Append(id, new byte[100]);
+            db.Append(id, new byte[1024]);
             ids.Add(id);
         }
 
@@ -124,9 +124,9 @@ public class RecoveryAndDefragTests : IDisposable
         // Verify remaining objects intact
         foreach (int idx in new[] { 0, 2, 4 })
         {
-            byte[] buf = new byte[100];
+            byte[] buf = new byte[1024];
             int read = db.ReadAt(ids[idx], 0, buf);
-            Assert.Equal(100, read);
+            Assert.Equal(1024, read);
             Assert.All(buf, b => Assert.Equal(0, b));
         }
     }

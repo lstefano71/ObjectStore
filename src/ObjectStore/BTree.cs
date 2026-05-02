@@ -205,19 +205,73 @@ public sealed class BTree
 
     private byte[]? SearchLeaf(long address, BTreeKey key)
     {
-        var node = ReadNode(address);
+        byte[] data = _file.ReadBlockAutoPayload(address);
+        return SearchLeafDirect(data, key);
+    }
 
-        if (node.IsLeaf)
+    /// <summary>
+    /// Searches for a key directly in serialized node data without full deserialization.
+    /// Binary-searches fixed-size keys, then extracts only the matching value.
+    /// </summary>
+    private byte[]? SearchLeafDirect(ReadOnlySpan<byte> data, BTreeKey key)
+    {
+        byte nodeType = data[0];
+        ushort keyCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(data[1..]);
+        // offset 3 = reserved
+        int keysStart = 4;
+
+        if (nodeType == BTreeNode.TypeLeaf)
         {
-            int i = FindKeyIndex(node, key);
-            if (i < node.KeyCount && node.Keys[i] == key)
-                return node.Values[i];
-            return null;
-        }
+            // Binary search over fixed-size keys (16 bytes each)
+            int lo = 0, hi = keyCount - 1;
+            int foundIdx = -1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >> 1;
+                var midKey = BTreeKey.ReadFrom(data[(keysStart + mid * BTreeKey.Size)..]);
+                int cmp = midKey.CompareTo(key);
+                if (cmp == 0) { foundIdx = mid; break; }
+                else if (cmp < 0) lo = mid + 1;
+                else hi = mid - 1;
+            }
 
-        // Internal: find child to descend into
-        int idx = FindChildIndex(node, key);
-        return SearchLeaf(node.Children[idx], key);
+            if (foundIdx < 0) return null;
+
+            // Skip to the value at foundIdx: values are length-prefixed (u16 + data)
+            int valuesStart = keysStart + keyCount * BTreeKey.Size;
+            int offset = valuesStart;
+            for (int i = 0; i < foundIdx; i++)
+            {
+                ushort len = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(data[offset..]);
+                offset += 2 + len;
+            }
+            ushort valueLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(data[offset..]);
+            return data.Slice(offset + 2, valueLen).ToArray();
+        }
+        else
+        {
+            // Internal node: find child index via binary search, descend
+            // Original logic: first i where key < keys[i] (key >= keys[i] means keep going right)
+            int childIdx = keyCount; // default: rightmost child
+            int lo = 0, hi = keyCount - 1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >> 1;
+                var midKey = BTreeKey.ReadFrom(data[(keysStart + mid * BTreeKey.Size)..]);
+                int cmp = key.CompareTo(midKey);
+                if (cmp < 0) { childIdx = mid; hi = mid - 1; }
+                else lo = mid + 1;
+            }
+
+            // Children start after keys
+            int childrenStart = keysStart + keyCount * BTreeKey.Size;
+            long childAddr = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(
+                data[(childrenStart + childIdx * 8)..]);
+
+            // Read next node and recurse
+            byte[] childData = _file.ReadBlockAutoPayload(childAddr);
+            return SearchLeafDirect(childData, key);
+        }
     }
 
     private BTreeNode InsertNonFull(BTreeNode node, BTreeKey key, byte[] value)

@@ -626,11 +626,12 @@ class TestPhase8Defragment:
     def test_defragment_basic(self):
         lib = self.lib
         # Create objects, delete some, defragment
+        # Use 1024 bytes to exceed inline threshold (512B) and force extent-based storage
         ids = []
         for i in range(5):
             obj_id = ctypes.c_uint64()
             lib.objstore_object_create(self.handle, f"obj{i}".encode(), ctypes.byref(obj_id))
-            lib.objstore_append(self.handle, obj_id, b"x" * 100, 100)
+            lib.objstore_append(self.handle, obj_id, b"x" * 1024, 1024)
             ids.append(obj_id.value)
 
         # Delete odd-indexed
@@ -645,11 +646,11 @@ class TestPhase8Defragment:
 
         # Verify remaining objects still readable
         for idx in [0, 2, 4]:
-            buf = ctypes.create_string_buffer(100)
+            buf = ctypes.create_string_buffer(1024)
             bytes_read = ctypes.c_int32()
-            rc = lib.objstore_read(self.handle, ids[idx], 0, buf, 100, ctypes.byref(bytes_read))
+            rc = lib.objstore_read(self.handle, ids[idx], 0, buf, 1024, ctypes.byref(bytes_read))
             assert rc == 0
-            assert bytes_read.value == 100
+            assert bytes_read.value == 1024
 
     def test_recover_clean_store(self):
         lib = self.lib

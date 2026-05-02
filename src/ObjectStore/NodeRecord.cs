@@ -19,20 +19,28 @@ public sealed class NodeRecord
     public long ExtentListAddress { get; set; }
     public long MetadataBlockAddress { get; set; }
     public byte CompressionCodec { get; set; } // 0=None, 1=LZ4, 2=Zstd
+    public byte[]? InlineData { get; set; } // Small object data stored directly in the B-tree leaf
 
     // Flag bits
     public const byte FlagHasData = 0x01;
     public const byte FlagHasChildren = 0x02;
     public const byte FlagIsDeleted = 0x04;
+    public const byte FlagInlineData = 0x08;
+
+    /// <summary>Maximum payload size for inline storage (bytes).</summary>
+    public const int InlineThreshold = 512;
 
     public bool HasData => (NodeTypeFlags & FlagHasData) != 0;
     public bool HasChildren => (NodeTypeFlags & FlagHasChildren) != 0;
     public bool IsDeleted => (NodeTypeFlags & FlagIsDeleted) != 0;
+    public bool HasInlineData => (NodeTypeFlags & FlagInlineData) != 0;
 
     public byte[] Serialize()
     {
         int nameByteCount = System.Text.Encoding.UTF8.GetByteCount(Name);
-        int size = 8 + 8 + 8 + 2 + nameByteCount + 1 + 8 + 4 + 8 + 8 + 8 + 8 + 1 + 3;
+        int inlineLen = InlineData?.Length ?? 0;
+        int size = 8 + 8 + 8 + 2 + nameByteCount + 1 + 8 + 4 + 8 + 8 + 8 + 8 + 1 + 3
+                 + (inlineLen > 0 ? 4 + inlineLen : 0);
         byte[] data = new byte[size];
         var span = data.AsSpan();
         int offset = 0;
@@ -50,7 +58,14 @@ public sealed class NodeRecord
         BinaryPrimitives.WriteInt64LittleEndian(span[offset..], ExtentListAddress); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(span[offset..], MetadataBlockAddress); offset += 8;
         span[offset++] = CompressionCodec;
-        // 3 bytes reserved (already zero)
+        // 3 bytes reserved
+        offset += 3;
+
+        if (inlineLen > 0)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(span[offset..], inlineLen); offset += 4;
+            InlineData.AsSpan().CopyTo(span[offset..]); offset += inlineLen;
+        }
 
         return data;
     }
@@ -73,6 +88,16 @@ public sealed class NodeRecord
         rec.ExtentListAddress = BinaryPrimitives.ReadInt64LittleEndian(data[offset..]); offset += 8;
         rec.MetadataBlockAddress = BinaryPrimitives.ReadInt64LittleEndian(data[offset..]); offset += 8;
         rec.CompressionCodec = data[offset++];
+        offset += 3; // reserved
+
+        if ((rec.NodeTypeFlags & FlagInlineData) != 0 && offset + 4 <= data.Length)
+        {
+            int inlineLen = BinaryPrimitives.ReadInt32LittleEndian(data[offset..]); offset += 4;
+            if (inlineLen > 0 && offset + inlineLen <= data.Length)
+            {
+                rec.InlineData = data.Slice(offset, inlineLen).ToArray();
+            }
+        }
 
         return rec;
     }

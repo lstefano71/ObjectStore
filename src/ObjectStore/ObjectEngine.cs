@@ -22,6 +22,10 @@ public sealed class ObjectEngine : IDisposable
     private ulong _lastKnownGeneration; // tracks generation we last committed or refreshed to
     private readonly List<long> _pendingBTreeFrees = new(); // B-tree freed blocks not yet persisted
 
+    // ID→(PrimaryKey, NodeRecord) lookup cache to avoid double B-tree traversal
+    private const int IdCacheCapacity = 1024;
+    private readonly Dictionary<ulong, (BTreeKey Key, NodeRecord Record)> _idCache = new();
+
     public ContainerFile File => _file;
     public BuddyAllocator Allocator => _allocator;
     public BTree Tree => _tree;
@@ -168,6 +172,7 @@ public sealed class ObjectEngine : IDisposable
             return;
 
         _file.BlockCache?.Clear();
+        IdCacheClear();
 
         if (active.BuddyRootAddress != 0)
         {
@@ -259,6 +264,7 @@ public sealed class ObjectEngine : IDisposable
 
             _tree.Delete(key);
             _idTree.Delete(new BTreeKey(0, id));
+            IdCacheInvalidate(id);
             AutoCommit();
             return true;
         }
@@ -292,7 +298,37 @@ public sealed class ObjectEngine : IDisposable
             var (key, record) = FindById(id);
             if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
 
-            // Load or create extent list
+            long newSize = record.Size + data.Length;
+
+            // Inline path: if object is currently inline (or empty) and new size fits
+            if (record.HasInlineData || (record.Size == 0 && record.ExtentListAddress == 0))
+            {
+                if (newSize <= NodeRecord.InlineThreshold && record.CompressionCodec == 0)
+                {
+                    // Append to inline data
+                    byte[] newInline = new byte[newSize];
+                    if (record.InlineData != null)
+                        record.InlineData.AsSpan().CopyTo(newInline);
+                    data.CopyTo(newInline.AsSpan((int)record.Size));
+
+                    record.InlineData = newInline;
+                    record.NodeTypeFlags |= NodeRecord.FlagInlineData;
+                    record.Size = newSize;
+                    record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    _tree.Update(key, record.Serialize());
+                    IdCacheInvalidate(id);
+                    AutoCommit();
+                    return;
+                }
+                else if (record.HasInlineData)
+                {
+                    // Promote: inline data exceeds threshold, move to extent-based storage
+                    PromoteInlineToExtents(record, key);
+                    // Fall through to normal extent-based append
+                }
+            }
+
+            // Normal extent-based append path
             var extents = LoadExtentList(record);
 
             int remaining = data.Length;
@@ -336,7 +372,8 @@ public sealed class ObjectEngine : IDisposable
                 int capacity = FormatConstants.PayloadSizeForOrder(order);
                 int toWrite = Math.Min(remaining, capacity);
 
-                long blockAddr = AllocateTracked(order);            _file.WriteBlock(blockAddr, order, data.Slice(dataOffset, toWrite));
+                long blockAddr = AllocateTracked(order);
+                _file.WriteBlock(blockAddr, order, data.Slice(dataOffset, toWrite));
                 extents.Extents.Add((blockAddr, order));
 
                 dataOffset += toWrite;
@@ -345,10 +382,11 @@ public sealed class ObjectEngine : IDisposable
 
             // Save extent list
             record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
-            record.Size += data.Length;
+            record.Size = newSize;
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
             _tree.Update(key, record.Serialize());
+            IdCacheInvalidate(id);
             AutoCommit();
         }
         finally
@@ -364,6 +402,15 @@ public sealed class ObjectEngine : IDisposable
         var (_, record) = FindById(id);
         if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
         if (offset >= record.Size) return 0;
+
+        // Inline path: data stored directly in the record
+        if (record.HasInlineData && record.InlineData != null)
+        {
+            int available = (int)(record.Size - offset);
+            int toRead = Math.Min(available, buffer.Length);
+            record.InlineData.AsSpan((int)offset, toRead).CopyTo(buffer);
+            return toRead;
+        }
 
         var extents = LoadExtentList(record);
         int bytesRead = 0;
@@ -409,6 +456,17 @@ public sealed class ObjectEngine : IDisposable
             if (offset + data.Length > record.Size)
                 throw new ArgumentException("WriteAt cannot extend the object. Use Append instead.");
 
+            // Inline path
+            if (record.HasInlineData && record.InlineData != null)
+            {
+                data.CopyTo(record.InlineData.AsSpan((int)offset));
+                record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                _tree.Update(key, record.Serialize());
+                IdCacheInvalidate(id);
+                AutoCommit();
+                return;
+            }
+
             var extents = LoadExtentList(record);
             long currentOffset = 0;
             long writeEnd = offset + data.Length;
@@ -444,6 +502,7 @@ public sealed class ObjectEngine : IDisposable
             record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _tree.Update(key, record.Serialize());
+            IdCacheInvalidate(id);
             AutoCommit();
         }
         finally
@@ -462,6 +521,26 @@ public sealed class ObjectEngine : IDisposable
             var (key, record) = FindById(id);
             if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
             if (newLength >= record.Size) return;
+
+            // Inline path
+            if (record.HasInlineData && record.InlineData != null)
+            {
+                if (newLength == 0)
+                {
+                    record.InlineData = null;
+                    record.NodeTypeFlags = (byte)(record.NodeTypeFlags & ~NodeRecord.FlagInlineData);
+                }
+                else
+                {
+                    record.InlineData = record.InlineData[..(int)newLength];
+                }
+                record.Size = newLength;
+                record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                _tree.Update(key, record.Serialize());
+                IdCacheInvalidate(id);
+                AutoCommit();
+                return;
+            }
 
             var extents = LoadExtentList(record);
 
@@ -482,6 +561,7 @@ public sealed class ObjectEngine : IDisposable
             record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _tree.Update(key, record.Serialize());
+            IdCacheInvalidate(id);
             AutoCommit();
         }
         finally
@@ -579,6 +659,7 @@ public sealed class ObjectEngine : IDisposable
 
             // Update ID index to point to the new primary key
             _idTree.Update(new BTreeKey(0, nodeId), newKey.Serialize());
+            IdCacheInvalidate(nodeId);
 
             // Update child counts
             UpdateChildCount(oldParentId, -1);
@@ -615,12 +696,14 @@ public sealed class ObjectEngine : IDisposable
                 FreeNodeData(rec);
                 _tree.Delete(key);
                 _idTree.Delete(new BTreeKey(0, rec.Id));
+                IdCacheInvalidate(rec.Id);
             }
 
             // Delete the node itself
             FreeNodeData(nodeRecord);
             _tree.Delete(nodeKey);
             _idTree.Delete(new BTreeKey(0, nodeId));
+            IdCacheInvalidate(nodeId);
 
             // Update parent's child count
             UpdateChildCount(parentId, -1);
@@ -745,6 +828,7 @@ public sealed class ObjectEngine : IDisposable
         try
         {
             _txn.Rollback();
+            IdCacheClear();
         }
         finally
         {
@@ -932,6 +1016,7 @@ public sealed class ObjectEngine : IDisposable
             record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _tree.Update(treeKey, record.Serialize());
+            IdCacheInvalidate(id);
             AutoCommit();
         }
         finally
@@ -966,6 +1051,7 @@ public sealed class ObjectEngine : IDisposable
             record.MetadataBlockAddress = SaveMetadata(metadata, record.MetadataBlockAddress);
             record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _tree.Update(treeKey, record.Serialize());
+            IdCacheInvalidate(id);
             AutoCommit();
             return true;
         }
@@ -1143,13 +1229,20 @@ public sealed class ObjectEngine : IDisposable
 
     private (BTreeKey Key, NodeRecord? Record) FindById(ulong id)
     {
+        // Check ID cache first
+        if (_idCache.TryGetValue(id, out var cached))
+            return (cached.Key, cached.Record);
+
         // Read-only migration fallback (in-memory dictionary)
         if (_idTreeFallback != null)
         {
             if (!_idTreeFallback.TryGetValue(id, out var primaryKey))
                 return (default, null);
             var val = _tree.Get(primaryKey);
-            return val == null ? (default, null) : (primaryKey, NodeRecord.Deserialize(val));
+            if (val == null) return (default, null);
+            var rec = NodeRecord.Deserialize(val);
+            IdCachePut(id, primaryKey, rec);
+            return (primaryKey, rec);
         }
 
         // Use secondary ID index: key=(0, id), value=serialized primary BTreeKey
@@ -1163,7 +1256,58 @@ public sealed class ObjectEngine : IDisposable
         if (value == null)
             return (default, null);
 
-        return (pKey, NodeRecord.Deserialize(value));
+        var record = NodeRecord.Deserialize(value);
+        IdCachePut(id, pKey, record);
+        return (pKey, record);
+    }
+
+    private void IdCachePut(ulong id, BTreeKey key, NodeRecord record)
+    {
+        if (_idCache.Count >= IdCacheCapacity)
+            _idCache.Clear(); // simple eviction: clear all when full
+        _idCache[id] = (key, record);
+    }
+
+    private void IdCacheInvalidate(ulong id)
+    {
+        _idCache.Remove(id);
+    }
+
+    private void IdCacheClear()
+    {
+        _idCache.Clear();
+    }
+
+    /// <summary>
+    /// Promotes an inline-data object to extent-based storage.
+    /// Allocates data blocks for the existing inline payload and clears inline state.
+    /// </summary>
+    private void PromoteInlineToExtents(NodeRecord record, BTreeKey key)
+    {
+        byte[] inlineData = record.InlineData!;
+        record.InlineData = null;
+        record.NodeTypeFlags = (byte)(record.NodeTypeFlags & ~NodeRecord.FlagInlineData);
+
+        // Write inline data to extent blocks
+        var extents = new ExtentList();
+        int remaining = inlineData.Length;
+        int dataOffset = 0;
+
+        while (remaining > 0)
+        {
+            int order = FormatConstants.OrderForPayload(Math.Min(remaining, FormatConstants.PayloadSizeForOrder(FormatConstants.OrderCount - 1)));
+            int capacity = FormatConstants.PayloadSizeForOrder(order);
+            int toWrite = Math.Min(remaining, capacity);
+
+            long blockAddr = AllocateTracked(order);
+            _file.WriteBlock(blockAddr, order, inlineData.AsSpan(dataOffset, toWrite));
+            extents.Extents.Add((blockAddr, order));
+
+            dataOffset += toWrite;
+            remaining -= toWrite;
+        }
+
+        record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
     }
 
     private ExtentList LoadExtentList(NodeRecord record)
