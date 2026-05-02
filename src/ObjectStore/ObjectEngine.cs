@@ -13,6 +13,7 @@ public sealed class ObjectEngine : IDisposable
     private readonly SuperblockManager _sbManager;
     private ulong _nextNodeId;
     private readonly TransactionManager _txn;
+    private readonly bool _readOnly;
 
     public ContainerFile File => _file;
     public BuddyAllocator Allocator => _allocator;
@@ -20,9 +21,10 @@ public sealed class ObjectEngine : IDisposable
     public ulong NextNodeId => _nextNodeId;
     public TransactionManager Transactions => _txn;
     internal SuperblockManager SuperblockManager => _sbManager;
+    public bool IsReadOnly => _readOnly;
 
     private ObjectEngine(ContainerFile file, BuddyAllocator allocator, BTree tree,
-                         SuperblockManager sbManager, ulong nextNodeId)
+                         SuperblockManager sbManager, ulong nextNodeId, bool readOnly = false)
     {
         _file = file;
         _allocator = allocator;
@@ -30,6 +32,7 @@ public sealed class ObjectEngine : IDisposable
         _sbManager = sbManager;
         _nextNodeId = nextNodeId;
         _txn = new TransactionManager(this);
+        _readOnly = readOnly;
     }
 
     /// <summary>Creates a new container.</summary>
@@ -87,6 +90,32 @@ public sealed class ObjectEngine : IDisposable
         return engine;
     }
 
+    /// <summary>Opens a container in read-only mode. No writes are allowed.</summary>
+    public static ObjectEngine OpenReadOnly(string path)
+    {
+        var file = ContainerFile.Open(path, readOnly: true);
+        var sbManager = new SuperblockManager(file);
+
+        if (!sbManager.TryLoad())
+            throw new InvalidOperationException("Container file has no valid superblock.");
+
+        var active = sbManager.Active;
+        if (!active.IsVersionCompatible)
+            throw new IncompatibleVersionException(active.VersionMajor, active.VersionMinor);
+
+        var allocator = new BuddyAllocator(file, FormatConstants.DataRegionOffset);
+
+        if (active.BuddyRootAddress != 0)
+        {
+            int buddyOrder = ReadBlockOrderFromHeader(file, (long)active.BuddyRootAddress);
+            var buddyData = file.ReadBlock((long)active.BuddyRootAddress, buddyOrder);
+            allocator.Deserialize(buddyData);
+        }
+
+        var tree = new BTree(allocator, file, (long)active.BTreeRootAddress);
+        return new ObjectEngine(file, allocator, tree, sbManager, active.NextNodeId, readOnly: true);
+    }
+
     /// <summary>Opens or creates a container.</summary>
     public static ObjectEngine OpenOrCreate(string path)
     {
@@ -98,6 +127,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Creates a new object with optional name. Returns the assigned ID.</summary>
     public ulong CreateObject(string? name = null, byte compressionCodec = 0)
     {
+        ThrowIfReadOnly();
         ulong id = _nextNodeId++;
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -123,6 +153,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Deletes an object by ID.</summary>
     public bool DeleteObject(ulong id)
     {
+        ThrowIfReadOnly();
         var (key, record) = FindById(id);
         if (record == null) return false;
 
@@ -157,6 +188,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Appends data to an object.</summary>
     public void Append(ulong id, ReadOnlySpan<byte> data)
     {
+        ThrowIfReadOnly();
         var (key, record) = FindById(id);
         if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
 
@@ -264,6 +296,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Overwrites data at a specific offset (same-size only).</summary>
     public void WriteAt(ulong id, long offset, ReadOnlySpan<byte> data)
     {
+        ThrowIfReadOnly();
         var (key, record) = FindById(id);
         if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
         if (offset + data.Length > record.Size)
@@ -313,6 +346,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Truncates an object to the specified length.</summary>
     public void Truncate(ulong id, long newLength)
     {
+        ThrowIfReadOnly();
         var (key, record) = FindById(id);
         if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
         if (newLength >= record.Size) return;
@@ -349,7 +383,11 @@ public sealed class ObjectEngine : IDisposable
     // --- Transaction support methods ---
 
     /// <summary>Begins an explicit transaction.</summary>
-    public void BeginTransaction() => _txn.Begin();
+    public void BeginTransaction()
+    {
+        ThrowIfReadOnly();
+        _txn.Begin();
+    }
 
     /// <summary>Commits the current transaction.</summary>
     public void CommitTransaction() => _txn.Commit();
@@ -397,6 +435,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Sets a metadata key-value pair on an object.</summary>
     public void SetMetadata(ulong id, string key, string value)
     {
+        ThrowIfReadOnly();
         var (treeKey, record) = FindById(id);
         if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
 
@@ -421,6 +460,7 @@ public sealed class ObjectEngine : IDisposable
     /// <summary>Deletes a metadata key. Returns true if the key existed.</summary>
     public bool DeleteMetadata(ulong id, string key)
     {
+        ThrowIfReadOnly();
         var (treeKey, record) = FindById(id);
         if (record == null) throw new ObjectNotFoundException($"Object {id} not found.");
 
@@ -505,8 +545,9 @@ public sealed class ObjectEngine : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        // Clear dirty flag on clean close
-        try { SetDirtyFlag(false); } catch { /* best-effort */ }
+        // Clear dirty flag on clean close (skip for read-only)
+        if (!_readOnly)
+            try { SetDirtyFlag(false); } catch { /* best-effort */ }
         _file.Dispose();
     }
 
@@ -614,5 +655,11 @@ public sealed class ObjectEngine : IDisposable
             sz <<= 1;
         }
         return order;
+    }
+
+    private void ThrowIfReadOnly()
+    {
+        if (_readOnly)
+            throw new ReadOnlyContainerException();
     }
 }

@@ -84,4 +84,24 @@ public static partial class NativeExports
             return NativeErrorHelper.Capture(ex);
         }
     }
+
+    [UnmanagedCallersOnly(EntryPoint = "objstore_open_readonly")]
+    public static unsafe int StoreOpenReadOnly(byte* pathUtf8, IntPtr options, IntPtr* outHandle)
+    {
+        try
+        {
+            if (pathUtf8 == null || outHandle == null)
+                return NativeErrorCodes.InvalidArg;
+
+            string path = Marshal.PtrToStringUTF8((IntPtr)pathUtf8)!;
+            var engine = ObjectEngine.OpenReadOnly(path);
+            *outHandle = HandleStore.Allocate(engine);
+            NativeErrorHelper.ClearLastError();
+            return NativeErrorCodes.Ok;
+        }
+        catch (Exception ex)
+        {
+            return NativeErrorHelper.Capture(ex);
+        }
+    }
 }

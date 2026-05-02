@@ -669,3 +669,89 @@ class TestPhase8Defragment:
         rc = lib.objstore_read(self.handle, obj_id, 0, buf, 4, ctypes.byref(bytes_read))
         assert rc == 0
         assert buf.raw == b"data"
+
+
+# ============================================================
+# Phase 9 Tests — Read-Only Mode
+# ============================================================
+
+class TestPhase9ReadOnly:
+    def test_open_readonly_can_read(self, lib, tmp_path):
+        path = str(tmp_path / "phase9_ro.db").encode("utf-8")
+
+        # Create store and write data
+        handle = ctypes.c_void_p()
+        rc = lib.objstore_create(path, None, ctypes.byref(handle))
+        assert rc == 0
+        obj_id = ctypes.c_uint64()
+        lib.objstore_object_create(handle, b"ro-obj", ctypes.byref(obj_id))
+        lib.objstore_append(handle, obj_id, b"readonly-data", 13)
+        lib.objstore_close(handle)
+
+        # Open read-only
+        ro_handle = ctypes.c_void_p()
+        rc = lib.objstore_open_readonly(path, None, ctypes.byref(ro_handle))
+        assert rc == 0
+
+        # Read data
+        buf = ctypes.create_string_buffer(13)
+        bytes_read = ctypes.c_int32()
+        rc = lib.objstore_read(ro_handle, obj_id, 0, buf, 13, ctypes.byref(bytes_read))
+        assert rc == 0
+        assert bytes_read.value == 13
+        assert buf.raw == b"readonly-data"
+
+        lib.objstore_close(ro_handle)
+
+    def test_readonly_rejects_write(self, lib, tmp_path):
+        path = str(tmp_path / "phase9_ro_wr.db").encode("utf-8")
+
+        # Create store
+        handle = ctypes.c_void_p()
+        lib.objstore_create(path, None, ctypes.byref(handle))
+        obj_id = ctypes.c_uint64()
+        lib.objstore_object_create(handle, b"obj", ctypes.byref(obj_id))
+        lib.objstore_close(handle)
+
+        # Open read-only
+        ro_handle = ctypes.c_void_p()
+        lib.objstore_open_readonly(path, None, ctypes.byref(ro_handle))
+
+        # Try to create an object (should fail)
+        new_id = ctypes.c_uint64()
+        rc = lib.objstore_object_create(ro_handle, b"fail", ctypes.byref(new_id))
+        assert rc == -4  # READONLY
+
+        lib.objstore_close(ro_handle)
+
+    def test_readonly_can_iterate(self, lib, tmp_path):
+        path = str(tmp_path / "phase9_ro_iter.db").encode("utf-8")
+
+        # Create store with objects
+        handle = ctypes.c_void_p()
+        lib.objstore_create(path, None, ctypes.byref(handle))
+        for name in [b"a", b"b", b"c"]:
+            obj_id = ctypes.c_uint64()
+            lib.objstore_object_create(handle, name, ctypes.byref(obj_id))
+        lib.objstore_close(handle)
+
+        # Open read-only and iterate
+        ro_handle = ctypes.c_void_p()
+        lib.objstore_open_readonly(path, None, ctypes.byref(ro_handle))
+
+        iter_h = ctypes.c_void_p()
+        rc = lib.objstore_list_begin(ro_handle, ctypes.byref(iter_h))
+        assert rc == 0
+
+        count = 0
+        while True:
+            out_id = ctypes.c_uint64()
+            out_size = ctypes.c_int64()
+            rc = lib.objstore_iter_next(iter_h, ctypes.byref(out_id), ctypes.byref(out_size))
+            if rc == 1:
+                break
+            count += 1
+        assert count == 3
+
+        lib.objstore_iter_close(iter_h)
+        lib.objstore_close(ro_handle)
