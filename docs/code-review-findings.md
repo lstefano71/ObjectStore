@@ -1,5 +1,7 @@
 # Code Review Findings — ObjectStore
 
+** ALL OF THE FINDINGS SHOULD NOW BE FIXED IN THE REPO. THIS DOCUMENT IS FOR HISTORICAL REFERENCE ONLY. **
+
 **Date:** 2026-05-02  
 **Scope:** Full implementation (src/ObjectStore, src/ObjectStore.Native)  
 **Test status at review time:** 180 xUnit + 49 Python FFI tests passing

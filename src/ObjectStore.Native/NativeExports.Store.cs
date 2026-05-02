@@ -129,4 +129,21 @@ public static partial class NativeExports
             return NativeErrorHelper.Capture(ex);
         }
     }
+
+    [UnmanagedCallersOnly(EntryPoint = "objstore_refresh")]
+    public static int StoreRefresh(IntPtr handle)
+    {
+        try
+        {
+            var engine = HandleStore.Get<ObjectEngine>(handle);
+            if (engine == null) return NativeErrorCodes.InvalidArg;
+            engine.Refresh();
+            NativeErrorHelper.ClearLastError();
+            return NativeErrorCodes.Ok;
+        }
+        catch (Exception ex)
+        {
+            return NativeErrorHelper.Capture(ex);
+        }
+    }
 }

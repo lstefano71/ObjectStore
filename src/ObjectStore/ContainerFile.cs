@@ -31,7 +31,7 @@ public sealed class ContainerFile : IDisposable
     public static ContainerFile Create(string path)
     {
         var stream = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite,
-            FileShare.None, 4096, FileOptions.RandomAccess);
+            FileShare.ReadWrite, bufferSize: 1, FileOptions.RandomAccess);
         return new ContainerFile(stream, path);
     }
 
@@ -39,8 +39,7 @@ public sealed class ContainerFile : IDisposable
     public static ContainerFile Open(string path, bool readOnly = false)
     {
         var access = readOnly ? FileAccess.Read : FileAccess.ReadWrite;
-        var share = readOnly ? FileShare.Read : FileShare.None;
-        var stream = new FileStream(path, FileMode.Open, access, share, 4096, FileOptions.RandomAccess);
+        var stream = new FileStream(path, FileMode.Open, access, FileShare.ReadWrite, bufferSize: 1, FileOptions.RandomAccess);
         return new ContainerFile(stream, path);
     }
 
@@ -48,7 +47,7 @@ public sealed class ContainerFile : IDisposable
     public static ContainerFile OpenOrCreate(string path)
     {
         var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite,
-            FileShare.None, 4096, FileOptions.RandomAccess);
+            FileShare.ReadWrite, bufferSize: 1, FileOptions.RandomAccess);
         return new ContainerFile(stream, path);
     }
 
@@ -144,6 +143,45 @@ public sealed class ContainerFile : IDisposable
     public void Flush()
     {
         _stream.Flush(flushToDisk: true);
+    }
+
+    // Lock sentinel offset — far beyond any real file data to avoid blocking reads.
+    private const long LockOffset = long.MaxValue - 1;
+
+    /// <summary>
+    /// Acquires an exclusive byte-range lock for cross-process write serialization.
+    /// Blocks until the lock is acquired or timeout expires.
+    /// </summary>
+    public void AcquireWriteLock(TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            try
+            {
+                _stream.Lock(LockOffset, 1);
+                return;
+            }
+            catch (IOException)
+            {
+                if (DateTime.UtcNow >= deadline)
+                    throw new LockTimeoutException(
+                        $"Could not acquire write lock within {timeout.TotalMilliseconds}ms.");
+                Thread.Sleep(1); // Brief yield before retry
+            }
+        }
+    }
+
+    /// <summary>Releases the exclusive byte-range write lock.</summary>
+    public void ReleaseWriteLock()
+    {
+        _stream.Unlock(LockOffset, 1);
+    }
+
+    /// <summary>Re-reads the file length from the OS (another process may have grown the file).</summary>
+    public void RefreshFileSize()
+    {
+        _fileSize = _stream.Length;
     }
 
     public void Dispose()

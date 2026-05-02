@@ -17,6 +17,10 @@ public sealed class ObjectEngine : IDisposable
     private readonly bool _readOnly;
     private int _lastBuddyBlockOrder; // order of the last committed buddy state block
     private Dictionary<ulong, BTreeKey>? _idTreeFallback; // read-only migration fallback
+    private TimeSpan _lockTimeout = TimeSpan.FromSeconds(30);
+    private bool _writeLockHeld;
+    private ulong _lastKnownGeneration; // tracks generation we last committed or refreshed to
+    private readonly List<long> _pendingBTreeFrees = new(); // B-tree freed blocks not yet persisted
 
     public ContainerFile File => _file;
     public BuddyAllocator Allocator => _allocator;
@@ -41,6 +45,7 @@ public sealed class ObjectEngine : IDisposable
         _txn = new TransactionManager(this);
         _readOnly = readOnly;
         _lastBuddyBlockOrder = lastBuddyBlockOrder;
+        _lastKnownGeneration = sbManager.Active.Generation;
     }
 
     /// <summary>Creates a new container.</summary>
@@ -148,15 +153,22 @@ public sealed class ObjectEngine : IDisposable
 
     /// <summary>
     /// Reloads the allocator and B-tree state from the latest committed superblock.
-    /// Used by writers in SharedAccess mode to get an up-to-date view after
-    /// acquiring the write lock (another writer may have committed since we opened).
+    /// Skips reload if we are already at the latest generation (our own last commit).
     /// </summary>
     internal void RefreshFromDisk()
     {
+        // Read superblock to check generation
         if (!_sbManager.TryLoad())
             throw new InvalidOperationException("Failed to reload superblock.");
 
         var active = _sbManager.Active;
+
+        // If we're already up-to-date, skip the full reload
+        if (active.Generation == _lastKnownGeneration)
+            return;
+
+        _file.BlockCache?.Clear();
+
         if (active.BuddyRootAddress != 0)
         {
             _lastBuddyBlockOrder = ReadBlockOrderFromHeader(_file, (long)active.BuddyRootAddress);
@@ -164,9 +176,28 @@ public sealed class ObjectEngine : IDisposable
             _allocator.Deserialize(buddyData);
         }
 
+        // Replay pending B-tree frees that were not yet persisted to the on-disk allocator.
+        // These are blocks freed after our last commit but before the allocator was serialized.
+        foreach (long addr in _pendingBTreeFrees)
+            _allocator.Free(addr, GetBlockOrderFromHeader(addr));
+
         _tree = new BTree(_allocator, _file, (long)active.BTreeRootAddress, _tree.Order);
         _idTree = new BTree(_allocator, _file, (long)active.IdIndexRootAddress, _idTree.Order);
         _nextNodeId = active.NextNodeId;
+        _lastKnownGeneration = active.Generation;
+    }
+
+    /// <summary>
+    /// Refreshes the engine state to see writes committed by other processes.
+    /// Invalidates the block cache and reloads tree roots from the latest superblock.
+    /// Safe to call from any process at any time (does not require the write lock).
+    /// </summary>
+    public void Refresh()
+    {
+        _file.RefreshFileSize();
+        // Force a full reload by resetting the generation tracker
+        _lastKnownGeneration = 0;
+        RefreshFromDisk();
     }
 
     /// <summary>Creates a new object with optional name. Returns the assigned ID.</summary>
@@ -614,24 +645,90 @@ public sealed class ObjectEngine : IDisposable
 
     // --- Transaction support methods ---
 
-    /// <summary>Begins an explicit transaction.</summary>
+    /// <summary>Begins an explicit transaction. Acquires the write lock.</summary>
     public void BeginTransaction()
     {
         ThrowIfReadOnly();
+        AcquireWriteLockAndRefresh();
         _txn.Begin();
     }
 
-    /// <summary>Commits the current transaction.</summary>
-    public void CommitTransaction() => _txn.Commit();
+    /// <summary>Commits the current transaction. Releases the write lock.</summary>
+    public void CommitTransaction()
+    {
+        try
+        {
+            _txn.Commit();
+        }
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
+    }
 
-    /// <summary>Rolls back the current transaction.</summary>
-    public void RollbackTransaction() => _txn.Rollback();
+    /// <summary>Rolls back the current transaction. Releases the write lock.</summary>
+    public void RollbackTransaction()
+    {
+        try
+        {
+            _txn.Rollback();
+        }
+        finally
+        {
+            if (!_txn.HasActiveTransaction)
+                ReleaseWriteLockIfHeld();
+        }
+    }
 
-    /// <summary>Auto-commits if no explicit transaction is active.</summary>
+    /// <summary>Auto-commits if no explicit transaction is active. Releases the write lock.</summary>
     private void AutoCommit()
     {
         if (!_txn.HasActiveTransaction)
-            CommitInternal();
+        {
+            try
+            {
+                CommitInternal();
+            }
+            finally
+            {
+                ReleaseWriteLockIfHeld();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Acquires the write lock and refreshes state from disk.
+    /// Called when beginning an explicit transaction or any auto-commit write.
+    /// </summary>
+    private void AcquireWriteLockAndRefresh()
+    {
+        if (!_writeLockHeld)
+        {
+            _file.AcquireWriteLock(_lockTimeout);
+            _writeLockHeld = true;
+            try
+            {
+                _file.RefreshFileSize();
+                RefreshFromDisk();
+            }
+            catch
+            {
+                _writeLockHeld = false;
+                _file.ReleaseWriteLock();
+                throw;
+            }
+        }
+    }
+
+    /// <summary>Releases the write lock if held.</summary>
+    private void ReleaseWriteLockIfHeld()
+    {
+        if (_writeLockHeld)
+        {
+            _writeLockHeld = false;
+            _file.ReleaseWriteLock();
+        }
     }
 
     /// <summary>Persists current state to superblock (called by TransactionManager on commit).</summary>
@@ -675,15 +772,30 @@ public sealed class ObjectEngine : IDisposable
         _file.Flush();
 
         _sbManager.Commit(sb);
+        _lastKnownGeneration = _sbManager.Active.Generation;
 
-        // Free old B-tree nodes that were replaced by COW mutations
-        // Safe to free after commit since the superblock now points to the new trees
+        // The allocator we just serialized includes any previously-pending B-tree frees
+        // (replayed during RefreshFromDisk or still in memory from last commit).
+        // Now that they're persisted, clear the pending list.
+        _pendingBTreeFrees.Clear();
+
+        // Free old B-tree nodes that were replaced by COW mutations.
+        // Safe to free after commit since the superblock now points to the new trees.
+        // Track them as pending in case a Refresh() reloads the allocator before next commit.
         foreach (long freedAddr in _tree.FreedBlocks)
-            _allocator.Free(freedAddr, GetBlockOrderFromHeader(freedAddr));
+        {
+            int order = GetBlockOrderFromHeader(freedAddr);
+            _allocator.Free(freedAddr, order);
+            _pendingBTreeFrees.Add(freedAddr);
+        }
         _tree.FreedBlocks.Clear();
 
         foreach (long freedAddr in _idTree.FreedBlocks)
-            _allocator.Free(freedAddr, GetBlockOrderFromHeader(freedAddr));
+        {
+            int order = GetBlockOrderFromHeader(freedAddr);
+            _allocator.Free(freedAddr, order);
+            _pendingBTreeFrees.Add(freedAddr);
+        }
         _idTree.FreedBlocks.Clear();
     }
 
@@ -848,7 +960,22 @@ public sealed class ObjectEngine : IDisposable
         _disposed = true;
         // Clear dirty flag on clean close (skip for read-only)
         if (!_readOnly)
-            try { SetDirtyFlag(false); } catch { /* best-effort */ }
+        {
+            try
+            {
+                _file.AcquireWriteLock(_lockTimeout);
+                try
+                {
+                    SetDirtyFlag(false);
+                }
+                finally
+                {
+                    _file.ReleaseWriteLock();
+                }
+            }
+            catch { /* best-effort */ }
+        }
+        ReleaseWriteLockIfHeld();
         _file.Dispose();
     }
 
@@ -1017,5 +1144,8 @@ public sealed class ObjectEngine : IDisposable
     {
         if (_readOnly)
             throw new ReadOnlyContainerException();
+        // Acquire write lock if not in an explicit transaction (auto-commit mode)
+        // or if we're in a transaction that hasn't acquired it yet.
+        AcquireWriteLockAndRefresh();
     }
 }

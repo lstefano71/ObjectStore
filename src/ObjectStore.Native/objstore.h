@@ -90,6 +90,7 @@ int objstore_open(const char* path, objstore_options_t opts, objstore_t* out_sto
 int objstore_open_or_create(const char* path, objstore_options_t opts, objstore_t* out_store);
 int objstore_open_readonly(const char* path, objstore_options_t opts, objstore_t* out_store);
 int objstore_close(objstore_t store);
+int objstore_refresh(objstore_t store);
 
 /* ============================================================
  * Object CRUD

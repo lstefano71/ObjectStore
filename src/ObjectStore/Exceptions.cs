@@ -54,3 +54,11 @@ public class ObjectAlreadyExistsException : Exception
 {
     public ObjectAlreadyExistsException(string message) : base(message) { }
 }
+
+/// <summary>
+/// Thrown when the write lock cannot be acquired within the configured timeout.
+/// </summary>
+public class LockTimeoutException : Exception
+{
+    public LockTimeoutException(string message) : base(message) { }
+}
