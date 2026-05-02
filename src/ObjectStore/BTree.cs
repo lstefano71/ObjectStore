@@ -4,6 +4,10 @@ namespace ObjectStore;
 /// COW B+ tree with composite (parent_id, name_hash) keys.
 /// All key-value pairs reside in leaf nodes only. Internal nodes hold separator keys.
 /// Each mutation produces new nodes; old node addresses go into FreedBlocks.
+/// 
+/// Transaction optimization: when BeginBatchMode() is active, blocks allocated
+/// by this tree are tracked. Subsequent mutations to the same block reuse it
+/// in-place (no new allocation), dramatically reducing write amplification.
 /// </summary>
 public sealed class BTree
 {
@@ -16,6 +20,9 @@ public sealed class BTree
     public List<long> FreedBlocks { get; } = new();
     public int Order => _order;
 
+    /// <summary>Tracks block addresses allocated by this tree in the current batch/transaction.</summary>
+    private HashSet<long>? _batchOwnedBlocks;
+
     private const int DefaultOrder = 32;
     private const int DefaultNodeBlockOrder = 8; // 16KB — holds ~147 entries, well above split threshold of 63
 
@@ -27,6 +34,18 @@ public sealed class BTree
         _order = order;
         _nodeBlockOrder = nodeBlockOrder;
         RootAddress = rootAddress;
+    }
+
+    /// <summary>Enables batch mode: subsequent writes reuse blocks allocated in this batch.</summary>
+    public void BeginBatchMode()
+    {
+        _batchOwnedBlocks = new HashSet<long>();
+    }
+
+    /// <summary>Ends batch mode and clears the owned-block tracking set.</summary>
+    public void EndBatchMode()
+    {
+        _batchOwnedBlocks = null;
     }
 
     public byte[]? Get(BTreeKey key)
@@ -66,8 +85,7 @@ public sealed class BTree
         else
         {
             var newRoot = InsertNonFull(rootNode, key, value);
-            FreedBlocks.Add(RootAddress);
-            RootAddress = WriteNode(rootNode);
+            RootAddress = WriteNodeReplace(rootNode, RootAddress);
         }
     }
 
@@ -77,7 +95,6 @@ public sealed class BTree
         long newRoot = UpdateLeaf(RootAddress, key, newValue, out bool found);
         if (found)
         {
-            FreedBlocks.Add(RootAddress);
             RootAddress = newRoot;
         }
         return found;
@@ -91,19 +108,24 @@ public sealed class BTree
         bool found = DeleteKey(rootNode, key);
         if (!found) return false;
 
-        FreedBlocks.Add(RootAddress);
-
         if (rootNode.KeyCount == 0 && !rootNode.IsLeaf)
         {
+            // Root collapsed — free the old root block
+            if (_batchOwnedBlocks != null && _batchOwnedBlocks.Contains(RootAddress))
+                _batchOwnedBlocks.Remove(RootAddress);
+            FreedBlocks.Add(RootAddress);
             RootAddress = rootNode.Children[0];
         }
         else if (rootNode.KeyCount == 0 && rootNode.IsLeaf)
         {
+            if (_batchOwnedBlocks != null && _batchOwnedBlocks.Contains(RootAddress))
+                _batchOwnedBlocks.Remove(RootAddress);
+            FreedBlocks.Add(RootAddress);
             RootAddress = 0;
         }
         else
         {
-            RootAddress = WriteNode(rootNode);
+            RootAddress = WriteNodeReplace(rootNode, RootAddress);
         }
         return true;
     }
@@ -138,7 +160,30 @@ public sealed class BTree
         long address = _allocator.Allocate(_nodeBlockOrder);
         _file.WriteBlockOwned(address, _nodeBlockOrder, data);
         node.Address = address;
+        _batchOwnedBlocks?.Add(address);
         return address;
+    }
+
+    /// <summary>
+    /// Writes a modified node, reusing its old address if it was allocated in the current batch.
+    /// Otherwise performs normal COW (allocate new, track old for freeing).
+    /// </summary>
+    private long WriteNodeReplace(BTreeNode node, long oldAddress)
+    {
+        if (_batchOwnedBlocks != null && _batchOwnedBlocks.Contains(oldAddress))
+        {
+            // Reuse in place — no new allocation, no free
+            byte[] data = node.Serialize();
+            _file.WriteBlockOwned(oldAddress, _nodeBlockOrder, data);
+            node.Address = oldAddress;
+            return oldAddress;
+        }
+        else
+        {
+            // Normal COW: free old, allocate new
+            FreedBlocks.Add(oldAddress);
+            return WriteNode(node);
+        }
     }
 
     private byte[]? SearchLeaf(long address, BTreeKey key)
@@ -189,8 +234,7 @@ public sealed class BTree
         }
 
         InsertNonFull(child, key, value);
-        FreedBlocks.Add(node.Children[childIdx]);
-        node.Children[childIdx] = WriteNode(child);
+        node.Children[childIdx] = WriteNodeReplace(child, node.Children[childIdx]);
         return node;
     }
 
@@ -205,7 +249,6 @@ public sealed class BTree
         if (fullChild.IsLeaf)
         {
             // B+ tree leaf split: right gets keys[mid..], left keeps keys[0..mid-1]
-            // Separator promoted to parent = right's first key (keys[mid])
             for (int j = mid; j < fullChild.KeyCount; j++)
             {
                 newRight.Keys.Add(fullChild.Keys[j]);
@@ -215,8 +258,8 @@ public sealed class BTree
             fullChild.Keys.RemoveRange(mid, fullChild.Keys.Count - mid);
             fullChild.Values.RemoveRange(mid, fullChild.Values.Count - mid);
 
-            FreedBlocks.Add(oldAddr);
-            long leftAddr = WriteNode(fullChild);
+            // Reuse old address for left child if batch-owned
+            long leftAddr = WriteNodeReplace(fullChild, oldAddr);
             long rightAddr = WriteNode(newRight);
 
             parent.Keys.Insert(childIndex, separator);
@@ -226,8 +269,6 @@ public sealed class BTree
         else
         {
             // Internal node split: median key is promoted, not duplicated
-            // Left: keys[0..mid-1], children[0..mid]
-            // Right: keys[mid+1..], children[mid+1..]
             var separator = fullChild.Keys[mid];
 
             for (int j = mid + 1; j < fullChild.KeyCount; j++)
@@ -238,8 +279,7 @@ public sealed class BTree
             fullChild.Keys.RemoveRange(mid, fullChild.Keys.Count - mid);
             fullChild.Children.RemoveRange(mid + 1, fullChild.Children.Count - (mid + 1));
 
-            FreedBlocks.Add(oldAddr);
-            long leftAddr = WriteNode(fullChild);
+            long leftAddr = WriteNodeReplace(fullChild, oldAddr);
             long rightAddr = WriteNode(newRight);
 
             parent.Keys.Insert(childIndex, separator);
@@ -259,7 +299,7 @@ public sealed class BTree
             {
                 node.Values[i] = newValue;
                 found = true;
-                return WriteNode(node);
+                return WriteNodeReplace(node, address);
             }
             found = false;
             return address;
@@ -269,9 +309,8 @@ public sealed class BTree
         long newChildAddr = UpdateLeaf(node.Children[childIdx], key, newValue, out found);
         if (found)
         {
-            FreedBlocks.Add(node.Children[childIdx]);
             node.Children[childIdx] = newChildAddr;
-            return WriteNode(node);
+            return WriteNodeReplace(node, address);
         }
         return address;
     }
@@ -307,11 +346,7 @@ public sealed class BTree
         bool found = DeleteKey(child, key);
         if (found)
         {
-            FreedBlocks.Add(node.Children[childIdx]);
-            node.Children[childIdx] = WriteNode(child);
-
-            // Update separator if needed: separator should be >= all keys in left subtree
-            // and < all keys in right subtree. After deletion in leaf, check separators.
+            node.Children[childIdx] = WriteNodeReplace(child, node.Children[childIdx]);
             UpdateSeparators(node);
         }
         return found;
@@ -373,10 +408,8 @@ public sealed class BTree
             leftSibling.Children.RemoveAt(leftSibling.Children.Count - 1);
         }
 
-        FreedBlocks.Add(parent.Children[childIdx]);
-        FreedBlocks.Add(parent.Children[childIdx - 1]);
-        parent.Children[childIdx] = WriteNode(child);
-        parent.Children[childIdx - 1] = WriteNode(leftSibling);
+        parent.Children[childIdx] = WriteNodeReplace(child, parent.Children[childIdx]);
+        parent.Children[childIdx - 1] = WriteNodeReplace(leftSibling, parent.Children[childIdx - 1]);
     }
 
     private void BorrowFromRight(BTreeNode parent, int childIdx)
@@ -401,10 +434,8 @@ public sealed class BTree
             rightSibling.Children.RemoveAt(0);
         }
 
-        FreedBlocks.Add(parent.Children[childIdx]);
-        FreedBlocks.Add(parent.Children[childIdx + 1]);
-        parent.Children[childIdx] = WriteNode(child);
-        parent.Children[childIdx + 1] = WriteNode(rightSibling);
+        parent.Children[childIdx] = WriteNodeReplace(child, parent.Children[childIdx]);
+        parent.Children[childIdx + 1] = WriteNodeReplace(rightSibling, parent.Children[childIdx + 1]);
     }
 
     private void Merge(BTreeNode parent, int leftIdx)
@@ -414,23 +445,25 @@ public sealed class BTree
 
         if (leftChild.IsLeaf)
         {
-            // Merge right into left (no separator in leaf merge)
             leftChild.Keys.AddRange(rightChild.Keys);
             leftChild.Values.AddRange(rightChild.Values);
         }
         else
         {
-            // Pull separator down, then merge
             leftChild.Keys.Add(parent.Keys[leftIdx]);
             leftChild.Keys.AddRange(rightChild.Keys);
             leftChild.Children.AddRange(rightChild.Children);
         }
 
         parent.Keys.RemoveAt(leftIdx);
-        FreedBlocks.Add(parent.Children[leftIdx]);
-        FreedBlocks.Add(parent.Children[leftIdx + 1]);
+        // Right child is consumed by merge — free or remove from owned set
+        long rightAddr = parent.Children[leftIdx + 1];
+        if (_batchOwnedBlocks != null && _batchOwnedBlocks.Contains(rightAddr))
+            _batchOwnedBlocks.Remove(rightAddr);
+        FreedBlocks.Add(rightAddr);
         parent.Children.RemoveAt(leftIdx + 1);
-        parent.Children[leftIdx] = WriteNode(leftChild);
+        // Left child is rewritten (reuse if batch-owned)
+        parent.Children[leftIdx] = WriteNodeReplace(leftChild, parent.Children[leftIdx]);
     }
 
     private void UpdateSeparators(BTreeNode internalNode)

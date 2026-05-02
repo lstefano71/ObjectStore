@@ -34,6 +34,8 @@ public sealed class TransactionManager
                 AllocatorFreeBlockCount = freeCount,
                 OriginalNextNodeId = _engine.NextNodeId,
             };
+            _engine.Tree.BeginBatchMode();
+            _engine.IdTree.BeginBatchMode();
         }
         else
         {
@@ -52,6 +54,13 @@ public sealed class TransactionManager
             };
             _current.Savepoints.Push(sp);
             _current.Depth++;
+
+            // Clear batch-owned tracking so blocks from before the savepoint
+            // get normal COW (preserving the pre-savepoint state for rollback).
+            _engine.Tree.EndBatchMode();
+            _engine.IdTree.EndBatchMode();
+            _engine.Tree.BeginBatchMode();
+            _engine.IdTree.BeginBatchMode();
         }
     }
 
@@ -69,7 +78,10 @@ public sealed class TransactionManager
         }
         else
         {
-            // Top-level commit: persist to disk
+            // Top-level commit: end batch mode before persisting
+            _engine.Tree.EndBatchMode();
+            _engine.IdTree.EndBatchMode();
+
             _engine.CommitInternal();
 
             // Execute deferred frees (blocks from before this transaction)
@@ -106,10 +118,19 @@ public sealed class TransactionManager
             _engine.RestoreRootAddress(sp.RootAddress);
             _engine.RestoreIdTreeRootAddress(sp.IdTreeRootAddress);
             _engine.RestoreNextNodeId(sp.NextNodeId);
+
+            // Reset batch tracking (allocator rolled back, old addresses invalid)
+            _engine.Tree.EndBatchMode();
+            _engine.IdTree.EndBatchMode();
+            _engine.Tree.BeginBatchMode();
+            _engine.IdTree.BeginBatchMode();
         }
         else
         {
-            // Full rollback to beginning of transaction
+            // Full rollback to beginning of transaction — end batch mode
+            _engine.Tree.EndBatchMode();
+            _engine.IdTree.EndBatchMode();
+
             _engine.Allocator.RestoreFromSnapshot(_current.AllocatorSnapshot,
                 _current.AllocatorDataRegionEnd, _current.AllocatorFreeBlockCount);
             _engine.RestoreRootAddress(_current.OriginalRootAddress);

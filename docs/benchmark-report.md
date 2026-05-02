@@ -510,3 +510,86 @@ cl /O2 /D_CRT_SECURE_NO_WARNINGS /DSQLITE_THREADSAFE=0 /DSQLITE_OMIT_LOAD_EXTENS
 bench_objstore.exe <path_to_ObjectStore.Native.dll> C:\temp
 bench_sqlite.exe C:\temp
 ```
+
+---
+
+## 12. HDD Results (D: 7200 RPM)
+
+Running the same C benchmarks on the HDD shows how disk latency affects both engines:
+
+| Benchmark | ObjectStore (ops/s) | SQLite (ops/s) | Ratio |
+|-----------|--------------------:|---------------:|------:|
+| Seq Write 256B | 4.4 | 17.7 | 4.0× SQLite |
+| Seq Write 64KB | 3.6 | 17.6 | 4.9× SQLite |
+| Seq Read 256B | 41,376 | 198,811 | 4.8× SQLite |
+| Seq Read 64KB | **30,153** | 12,590 | **2.4× ObjectStore** |
+| Txn Batch 256B | 435 | 4,133 | 9.5× SQLite |
+| Txn Batch 64KB | 230 | 252 | ~1.1× (tied) |
+
+**Observations:**
+- HDD seek time (~8ms) dominates single-operation latency: ObjectStore 4.4 ops/s ≈ 227ms/op (multiple seeks per commit)
+- Read performance for cached data is similar to SSD (all objects fit in the SIEVE cache)
+- Transaction batch gap narrows dramatically on HDD (9.5× vs 46× on SSD) — fsync latency dominates both engines
+- Large blob batch writes are effectively tied on HDD (I/O bound on both)
+
+---
+
+## 13. Transaction Batch Optimization: In-Place B-Tree Mutation
+
+### Problem
+
+Each Insert in the COW B-tree allocated a NEW block address for every modified node, even within a single transaction. For 200 inserts: 200 intermediate root writes, 200 leaf writes, all immediately freed — massive write amplification.
+
+### Solution
+
+Added **transaction-scoped in-place mutation**: during an explicit transaction, the B-tree tracks which blocks it allocated. On subsequent modifications to the same node, it overwrites in-place instead of allocating a new block.
+
+**Key change in `BTree.cs`:**
+```csharp
+private long WriteNodeReplace(BTreeNode node, long oldAddress)
+{
+    if (_batchOwnedBlocks != null && _batchOwnedBlocks.Contains(oldAddress))
+    {
+        // Reuse in place — no new allocation, no free
+        byte[] data = node.Serialize();
+        _file.WriteBlockOwned(oldAddress, _nodeBlockOrder, data);
+        return oldAddress;
+    }
+    // Normal COW path
+    FreedBlocks.Add(oldAddress);
+    return WriteNode(node);
+}
+```
+
+**Savepoint safety:** Batch-owned tracking is cleared on savepoint push/rollback to preserve rollback correctness.
+
+### Results (SSD, C:\temp)
+
+| Benchmark | Before | After | Improvement |
+|-----------|-------:|------:|------------:|
+| Txn Batch 256B (ops/s) | 1,947 | **9,840** | **5.1×** |
+| Txn Batch 64KB (ops/s) | 1,021 | **1,090** | 1.07× |
+| Gap vs SQLite (256B) | 46× | **7.8×** | Gap reduced 6× |
+| Gap vs SQLite (64KB) | 1.3× SQLite | **1.04× ObjectStore** | ObjectStore now wins |
+
+### Updated Comparison Table (SSD, Post-Optimization)
+
+| Benchmark | ObjectStore (ops/s) | SQLite (ops/s) | Ratio |
+|-----------|--------------------:|---------------:|------:|
+| Seq Write 256B | 198 | 538 | 2.7× SQLite |
+| Seq Write 64KB | 155 | 300 | 1.9× SQLite |
+| Seq Read 256B | 44,065 | 118,748 | 2.7× SQLite |
+| Seq Read 64KB | **27,839** | 11,102 | **2.5× ObjectStore** |
+| Txn Batch 256B | 9,840 | 77,101 | 7.8× SQLite |
+| Txn Batch 64KB | **1,090** | 1,049 | **1.04× ObjectStore** |
+
+### Analysis
+
+The optimization reduces the B-tree write amplification from O(n × h) to O(leaves + h) per transaction where n=inserts, h=tree height, leaves=distinct modified leaf nodes. For 200 inserts into a tree with order 32 (max 63 keys/leaf):
+- Before: ~200 × 2 trees × 2.5 levels = ~1000 node writes
+- After: ~4 leaves × 2 trees + ~3 internal nodes × 2 = ~14 node writes
+
+This explains the ~5× throughput improvement. The remaining 7.8× gap vs SQLite is due to:
+1. ObjectStore still writes allocator state + superblock per commit (SQLite: WAL only)
+2. ObjectStore uses 16KB blocks vs SQLite's 4KB pages
+3. SQLite's WAL is append-only (sequential I/O) vs ObjectStore's scattered block writes
