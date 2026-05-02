@@ -118,6 +118,77 @@ public sealed class ContainerFile : IDisposable
     }
 
     /// <summary>
+    /// Reads a block by first peeking the block size from the header.
+    /// Use when the order is not known in advance (e.g., dynamically-sized B-tree nodes).
+    /// Returns (payload, order).
+    /// </summary>
+    public (byte[] Payload, int Order) ReadBlockAuto(long address)
+    {
+        if (_blockCache != null && _blockCache.TryGet(address, out var cached))
+        {
+            // For cached blocks we still need to return the order. Peek the header.
+            Span<byte> hdr = stackalloc byte[4];
+            ReadRaw(address, hdr);
+            int cachedBlockSize = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(hdr);
+            int cachedOrder = FormatConstants.OrderFromBlockSize(cachedBlockSize);
+            return (cached!, cachedOrder);
+        }
+
+        // Peek the first 4 bytes to determine block size
+        Span<byte> header = stackalloc byte[4];
+        ReadRaw(address, header);
+        int blockSize = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(header);
+        int order = FormatConstants.OrderFromBlockSize(blockSize);
+
+        byte[] raw = System.Buffers.ArrayPool<byte>.Shared.Rent(blockSize);
+        try
+        {
+            ReadRaw(address, raw.AsSpan(0, blockSize));
+            int payloadSize = BlockHeader.Validate(raw.AsSpan(0, blockSize));
+            byte[] payload = new byte[payloadSize];
+            raw.AsSpan(FormatConstants.BlockHeaderSize, payloadSize).CopyTo(payload);
+
+            _blockCache?.Put(address, payload);
+            return (payload, order);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(raw);
+        }
+    }
+
+    /// <summary>
+    /// Reads a block by peeking the header to determine size. Returns payload only.
+    /// Use when the order is not needed (e.g., B-tree node deserialization).
+    /// </summary>
+    public byte[] ReadBlockAutoPayload(long address)
+    {
+        if (_blockCache != null && _blockCache.TryGet(address, out var cached))
+            return cached!;
+
+        // Peek the first 4 bytes to determine block size
+        Span<byte> header = stackalloc byte[4];
+        ReadRaw(address, header);
+        int blockSize = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(header);
+
+        byte[] raw = System.Buffers.ArrayPool<byte>.Shared.Rent(blockSize);
+        try
+        {
+            ReadRaw(address, raw.AsSpan(0, blockSize));
+            int payloadSize = BlockHeader.Validate(raw.AsSpan(0, blockSize));
+            byte[] payload = new byte[payloadSize];
+            raw.AsSpan(FormatConstants.BlockHeaderSize, payloadSize).CopyTo(payload);
+
+            _blockCache?.Put(address, payload);
+            return payload;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(raw);
+        }
+    }
+
+    /// <summary>
     /// Writes a block at the given address. Prepends the block header with checksum.
     /// Invalidates and updates the cache.
     /// </summary>

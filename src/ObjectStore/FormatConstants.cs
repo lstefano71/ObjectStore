@@ -82,4 +82,17 @@ public static class FormatConstants
             throw new ArgumentException($"Payload size {payloadSize} exceeds maximum block capacity.");
         return order;
     }
+
+    /// <summary>Computes the order from a block size value (inverse of BlockSizeForOrder).</summary>
+    public static int OrderFromBlockSize(int blockSize)
+    {
+        int order = 0;
+        int sz = MinBlockSize;
+        while (sz < blockSize && order < OrderCount - 1)
+        {
+            order++;
+            sz <<= 1;
+        }
+        return order;
+    }
 }

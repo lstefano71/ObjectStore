@@ -11,6 +11,8 @@ public sealed class BuddyAllocator
 {
     // In-memory free lists: one list of free block addresses per order
     private readonly List<long>[] _freeLists = new List<long>[FormatConstants.OrderCount];
+    // Parallel hash sets for O(1) membership test during coalescing
+    private readonly HashSet<long>[] _freeListSets = new HashSet<long>[FormatConstants.OrderCount];
     private readonly ContainerFile _file;
     private long _dataRegionEnd;
 
@@ -22,7 +24,10 @@ public sealed class BuddyAllocator
         _file = file;
         _dataRegionEnd = dataRegionEnd;
         for (int i = 0; i < FormatConstants.OrderCount; i++)
+        {
             _freeLists[i] = new List<long>();
+            _freeListSets[i] = new HashSet<long>();
+        }
     }
 
     /// <summary>Gets the current data region end (one past the last allocated/managed byte).</summary>
@@ -148,10 +153,12 @@ public sealed class BuddyAllocator
         {
             int count = BinaryPrimitives.ReadInt32LittleEndian(data[offset..]); offset += 4;
             _freeLists[i].Clear();
+            _freeListSets[i].Clear();
             for (int j = 0; j < count; j++)
             {
                 long addr = BinaryPrimitives.ReadInt64LittleEndian(data[offset..]); offset += 8;
                 _freeLists[i].Add(addr);
+                _freeListSets[i].Add(addr);
             }
         }
     }
@@ -172,6 +179,9 @@ public sealed class BuddyAllocator
         {
             _freeLists[i].Clear();
             _freeLists[i].AddRange(freeLists[i]);
+            _freeListSets[i].Clear();
+            foreach (var addr in freeLists[i])
+                _freeListSets[i].Add(addr);
         }
         _dataRegionEnd = dataRegionEnd;
         FreeBlockCount = freeBlockCount;
@@ -190,10 +200,11 @@ public sealed class BuddyAllocator
     /// <summary>Restores from a legacy snapshot (heads + data region end).</summary>
     public void RestoreFromSnapshot(long[] snapshot, long dataRegionEnd, int freeBlockCount)
     {
-        // This is used by TransactionManager — we need proper snapshot now
-        // For backward compat, just restore basics
         for (int i = 0; i < FormatConstants.OrderCount; i++)
+        {
             _freeLists[i].Clear();
+            _freeListSets[i].Clear();
+        }
         _dataRegionEnd = dataRegionEnd;
         FreeBlockCount = freeBlockCount;
     }
@@ -210,6 +221,7 @@ public sealed class BuddyAllocator
         // Pop from end for O(1) performance
         long address = list[^1];
         list.RemoveAt(list.Count - 1);
+        _freeListSets[order].Remove(address);
         FreeBlockCount--;
         return address;
     }
@@ -217,16 +229,18 @@ public sealed class BuddyAllocator
     private void PushFreeBlock(int order, long address)
     {
         _freeLists[order].Add(address);
+        _freeListSets[order].Add(address);
         FreeBlockCount++;
     }
 
     private bool TryRemoveFromFreeList(int order, long targetAddress)
     {
+        if (!_freeListSets[order].Remove(targetAddress))
+            return false;
+
+        // Remove from list — swap with last for O(1) removal
         var list = _freeLists[order];
         int idx = list.IndexOf(targetAddress);
-        if (idx < 0) return false;
-
-        // Swap with last for O(1) removal
         list[idx] = list[^1];
         list.RemoveAt(list.Count - 1);
         FreeBlockCount--;
@@ -255,7 +269,10 @@ public sealed class BuddyAllocator
     public void Reset()
     {
         for (int i = 0; i < FormatConstants.OrderCount; i++)
+        {
             _freeLists[i].Clear();
+            _freeListSets[i].Clear();
+        }
         FreeBlockCount = 0;
         _dataRegionEnd = FormatConstants.DataRegionOffset;
     }

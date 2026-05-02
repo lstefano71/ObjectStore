@@ -20,11 +20,11 @@ public sealed class BTree
     public List<long> FreedBlocks { get; } = new();
     public int Order => _order;
 
-    /// <summary>Tracks block addresses allocated by this tree in the current batch/transaction.</summary>
-    private HashSet<long>? _batchOwnedBlocks;
+    /// <summary>Tracks block addresses allocated by this tree in the current batch/transaction, with their order.</summary>
+    private Dictionary<long, int>? _batchOwnedBlocks;
 
     private const int DefaultOrder = 32;
-    private const int DefaultNodeBlockOrder = 8; // 16KB — holds ~147 entries, well above split threshold of 63
+    private const int DefaultNodeBlockOrder = 8; // 16KB — historical default, now nodes are dynamically sized
 
     public BTree(BuddyAllocator allocator, ContainerFile file,
                  long rootAddress = 0, int order = DefaultOrder, int nodeBlockOrder = DefaultNodeBlockOrder)
@@ -39,7 +39,7 @@ public sealed class BTree
     /// <summary>Enables batch mode: subsequent writes reuse blocks allocated in this batch.</summary>
     public void BeginBatchMode()
     {
-        _batchOwnedBlocks = new HashSet<long>();
+        _batchOwnedBlocks = new Dictionary<long, int>();
     }
 
     /// <summary>Ends batch mode and clears the owned-block tracking set.</summary>
@@ -111,14 +111,14 @@ public sealed class BTree
         if (rootNode.KeyCount == 0 && !rootNode.IsLeaf)
         {
             // Root collapsed — free the old root block
-            if (_batchOwnedBlocks != null && _batchOwnedBlocks.Contains(RootAddress))
+            if (_batchOwnedBlocks != null && _batchOwnedBlocks.ContainsKey(RootAddress))
                 _batchOwnedBlocks.Remove(RootAddress);
             FreedBlocks.Add(RootAddress);
             RootAddress = rootNode.Children[0];
         }
         else if (rootNode.KeyCount == 0 && rootNode.IsLeaf)
         {
-            if (_batchOwnedBlocks != null && _batchOwnedBlocks.Contains(RootAddress))
+            if (_batchOwnedBlocks != null && _batchOwnedBlocks.ContainsKey(RootAddress))
                 _batchOwnedBlocks.Remove(RootAddress);
             FreedBlocks.Add(RootAddress);
             RootAddress = 0;
@@ -150,17 +150,18 @@ public sealed class BTree
 
     private BTreeNode ReadNode(long address)
     {
-        byte[] data = _file.ReadBlock(address, _nodeBlockOrder);
+        byte[] data = _file.ReadBlockAutoPayload(address);
         return BTreeNode.Deserialize(data);
     }
 
     private long WriteNode(BTreeNode node)
     {
         byte[] data = node.Serialize();
-        long address = _allocator.Allocate(_nodeBlockOrder);
-        _file.WriteBlockOwned(address, _nodeBlockOrder, data);
+        int order = FormatConstants.OrderForPayload(data.Length);
+        long address = _allocator.Allocate(order);
+        _file.WriteBlockOwned(address, order, data);
         node.Address = address;
-        _batchOwnedBlocks?.Add(address);
+        _batchOwnedBlocks?.TryAdd(address, order);
         return address;
     }
 
@@ -170,13 +171,29 @@ public sealed class BTree
     /// </summary>
     private long WriteNodeReplace(BTreeNode node, long oldAddress)
     {
-        if (_batchOwnedBlocks != null && _batchOwnedBlocks.Contains(oldAddress))
+        if (_batchOwnedBlocks != null && _batchOwnedBlocks.TryGetValue(oldAddress, out int oldOrder))
         {
-            // Reuse in place — no new allocation, no free
             byte[] data = node.Serialize();
-            _file.WriteBlockOwned(oldAddress, _nodeBlockOrder, data);
-            node.Address = oldAddress;
-            return oldAddress;
+            int newOrder = FormatConstants.OrderForPayload(data.Length);
+
+            if (newOrder <= oldOrder)
+            {
+                // Still fits — reuse in place
+                _file.WriteBlockOwned(oldAddress, oldOrder, data);
+                node.Address = oldAddress;
+                return oldAddress;
+            }
+            else
+            {
+                // Outgrew old block — free old, allocate new
+                _batchOwnedBlocks.Remove(oldAddress);
+                _allocator.Free(oldAddress, oldOrder);
+                long address = _allocator.Allocate(newOrder);
+                _file.WriteBlockOwned(address, newOrder, data);
+                node.Address = address;
+                _batchOwnedBlocks[address] = newOrder;
+                return address;
+            }
         }
         else
         {
@@ -458,7 +475,7 @@ public sealed class BTree
         parent.Keys.RemoveAt(leftIdx);
         // Right child is consumed by merge — free or remove from owned set
         long rightAddr = parent.Children[leftIdx + 1];
-        if (_batchOwnedBlocks != null && _batchOwnedBlocks.Contains(rightAddr))
+        if (_batchOwnedBlocks != null && _batchOwnedBlocks.ContainsKey(rightAddr))
             _batchOwnedBlocks.Remove(rightAddr);
         FreedBlocks.Add(rightAddr);
         parent.Children.RemoveAt(leftIdx + 1);
