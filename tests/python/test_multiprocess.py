@@ -244,8 +244,10 @@ class TestMultiProcessCorrectness:
         results = _collect_results(procs, timeout=120)
 
         for i, r in enumerate(results):
+            errors = [l for l in r["lines"] if l.get("type") == "error"]
             assert r["returncode"] == 0, (
-                f"Worker {i} failed: rc={r['returncode']}, stderr={r['stderr']}"
+                f"Worker {i} failed: rc={r['returncode']}, "
+                f"errors={errors}, stdout={r['stdout'][:500]}, stderr={r['stderr']}"
             )
 
         # Count total objects created

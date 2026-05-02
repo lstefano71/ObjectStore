@@ -19,6 +19,7 @@ typedef void* objstore_options_t;
 
 typedef int (*fn_options_create)(objstore_options_t*);
 typedef int (*fn_options_free)(objstore_options_t);
+typedef int (*fn_options_set_multi_process)(objstore_options_t, int);
 typedef int (*fn_open_or_create)(const char*, objstore_options_t, objstore_t*);
 typedef int (*fn_close)(objstore_t);
 typedef int (*fn_object_create)(objstore_t, const char*, uint64_t*);
@@ -27,10 +28,12 @@ typedef int (*fn_read)(objstore_t, uint64_t, int64_t, uint8_t*, int32_t, int32_t
 typedef int (*fn_txn_begin)(objstore_t);
 typedef int (*fn_txn_commit)(objstore_t);
 typedef int (*fn_object_get_size)(objstore_t, uint64_t, int64_t*);
+typedef int (*fn_refresh)(objstore_t);
 
 /* ---- Globals ---- */
 static fn_options_create    p_options_create;
 static fn_options_free      p_options_free;
+static fn_options_set_multi_process p_options_set_multi_process;
 static fn_open_or_create    p_open_or_create;
 static fn_close             p_close;
 static fn_object_create     p_object_create;
@@ -39,6 +42,7 @@ static fn_read              p_read;
 static fn_txn_begin         p_txn_begin;
 static fn_txn_commit        p_txn_commit;
 static fn_object_get_size   p_object_get_size;
+static fn_refresh           p_refresh;
 
 static LARGE_INTEGER qpc_freq;
 
@@ -59,6 +63,7 @@ static int load_dll(const char* dll_path) {
     
     LOAD(options_create);
     LOAD(options_free);
+    LOAD(options_set_multi_process);
     LOAD(open_or_create);
     LOAD(close);
     LOAD(object_create);
@@ -67,6 +72,7 @@ static int load_dll(const char* dll_path) {
     LOAD(txn_begin);
     LOAD(txn_commit);
     LOAD(object_get_size);
+    LOAD(refresh);
     #undef LOAD
     return 1;
 }
@@ -178,7 +184,7 @@ int main(int argc, char* argv[]) {
     
     if (!load_dll(dll_path)) return 1;
     
-    printf("=== ObjectStore C Benchmark ===\n");
+    printf("=== ObjectStore C Benchmark (MultiProcessMode / AutoRefresh) ===\n");
     printf("DLL: %s\n", dll_path);
     printf("Directory: %s\n\n", db_dir);
     
@@ -201,6 +207,7 @@ int main(int argc, char* argv[]) {
         objstore_options_t opts;
         objstore_t store;
         p_options_create(&opts);
+        p_options_set_multi_process(opts, 1);
         int rc = p_open_or_create(db_path, opts, &store);
         if (rc != 0) { fprintf(stderr, "open failed: %d\n", rc); return 1; }
         p_options_free(opts);
@@ -220,6 +227,7 @@ int main(int argc, char* argv[]) {
         objstore_options_t opts;
         objstore_t store;
         p_options_create(&opts);
+        p_options_set_multi_process(opts, 1);
         int rc = p_open_or_create(db_path, opts, &store);
         if (rc != 0) { fprintf(stderr, "open failed: %d\n", rc); return 1; }
         p_options_free(opts);
@@ -239,6 +247,7 @@ int main(int argc, char* argv[]) {
         objstore_options_t opts;
         objstore_t store;
         p_options_create(&opts);
+        p_options_set_multi_process(opts, 1);
         int rc = p_open_or_create(db_path, opts, &store);
         if (rc != 0) { fprintf(stderr, "open failed: %d\n", rc); return 1; }
         p_options_free(opts);
@@ -261,6 +270,7 @@ int main(int argc, char* argv[]) {
         objstore_options_t opts;
         objstore_t store;
         p_options_create(&opts);
+        p_options_set_multi_process(opts, 1);
         int rc = p_open_or_create(db_path, opts, &store);
         if (rc != 0) { fprintf(stderr, "open failed: %d\n", rc); return 1; }
         p_options_free(opts);
@@ -283,6 +293,7 @@ int main(int argc, char* argv[]) {
         objstore_options_t opts;
         objstore_t store;
         p_options_create(&opts);
+        p_options_set_multi_process(opts, 1);
         int rc = p_open_or_create(db_path, opts, &store);
         if (rc != 0) { fprintf(stderr, "open failed: %d\n", rc); return 1; }
         p_options_free(opts);
@@ -302,6 +313,7 @@ int main(int argc, char* argv[]) {
         objstore_options_t opts;
         objstore_t store;
         p_options_create(&opts);
+        p_options_set_multi_process(opts, 1);
         int rc = p_open_or_create(db_path, opts, &store);
         if (rc != 0) { fprintf(stderr, "open failed: %d\n", rc); return 1; }
         p_options_free(opts);

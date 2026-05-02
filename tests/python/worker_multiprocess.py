@@ -18,6 +18,42 @@ import time
 def load_lib(lib_path):
     """Load the native library and set up function signatures."""
     lib = ctypes.CDLL(lib_path)
+
+    # Set argtypes/restype for all functions to ensure correct 64-bit argument marshaling
+    lib.objstore_open_or_create.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.objstore_open_or_create.restype = ctypes.c_int
+
+    lib.objstore_close.argtypes = [ctypes.c_void_p]
+    lib.objstore_close.restype = ctypes.c_int
+
+    lib.objstore_refresh.argtypes = [ctypes.c_void_p]
+    lib.objstore_refresh.restype = ctypes.c_int
+
+    lib.objstore_object_create.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint64)]
+    lib.objstore_object_create.restype = ctypes.c_int
+
+    lib.objstore_append.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32]
+    lib.objstore_append.restype = ctypes.c_int
+
+    lib.objstore_object_exists.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int32)]
+    lib.objstore_object_exists.restype = ctypes.c_int
+
+    lib.objstore_object_get_size.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int64)]
+    lib.objstore_object_get_size.restype = ctypes.c_int
+
+    lib.objstore_read.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int64,
+                                  ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)]
+    lib.objstore_read.restype = ctypes.c_int
+
+    lib.objstore_list_begin.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.objstore_list_begin.restype = ctypes.c_int
+
+    lib.objstore_iter_next.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int64)]
+    lib.objstore_iter_next.restype = ctypes.c_int
+
+    lib.objstore_iter_close.argtypes = [ctypes.c_void_p]
+    lib.objstore_iter_close.restype = ctypes.c_int
+
     return lib
 
 
@@ -65,7 +101,7 @@ def action_write_objects(lib, handle, args):
         # Write data: worker_id + index + pattern (verifiable via SHA256)
         data = f"worker={worker_id},index={i},payload={'X' * 100}".encode("utf-8")
         data_buf = (ctypes.c_uint8 * len(data))(*data)
-        rc = lib.objstore_append(handle, obj_id, data_buf, ctypes.c_int64(len(data)))
+        rc = lib.objstore_append(handle, obj_id, data_buf, len(data))
         if rc != 0:
             emit({"type": "error", "msg": f"Append failed: rc={rc}, id={obj_id.value}"})
             sys.exit(1)
@@ -100,10 +136,10 @@ def action_verify_objects(lib, handle, args):
 
         # Read data
         buf = (ctypes.c_uint8 * size.value)()
-        bytes_read = ctypes.c_int64()
+        bytes_read = ctypes.c_int32()
         rc = lib.objstore_read(
             handle, ctypes.c_uint64(obj_id), ctypes.c_int64(0),
-            buf, ctypes.c_int64(size.value), ctypes.byref(bytes_read)
+            buf, ctypes.c_int32(size.value), ctypes.byref(bytes_read)
         )
         if rc != 0:
             errors += 1
@@ -151,7 +187,7 @@ def action_hybrid_read_write(lib, handle, args):
 
         data = f"hybrid_{worker_id}_{r}".encode("utf-8")
         data_buf = (ctypes.c_uint8 * len(data))(*data)
-        rc = lib.objstore_append(handle, obj_id, data_buf, ctypes.c_int64(len(data)))
+        rc = lib.objstore_append(handle, obj_id, data_buf, len(data))
         if rc != 0:
             errors += 1
             continue
@@ -191,7 +227,7 @@ def action_slow_writer(lib, handle, args):
 
         data = f"slow_data_{worker_id}_{i}_{'P' * 50}".encode("utf-8")
         data_buf = (ctypes.c_uint8 * len(data))(*data)
-        lib.objstore_append(handle, obj_id, data_buf, ctypes.c_int64(len(data)))
+        lib.objstore_append(handle, obj_id, data_buf, len(data))
 
         emit({"type": "created", "id": obj_id.value})
         time.sleep(delay_ms / 1000.0)
@@ -247,10 +283,10 @@ def action_read_objects(lib, handle, args):
             lib.objstore_object_get_size(handle, ctypes.c_uint64(obj_id), ctypes.byref(size))
             if size.value > 0:
                 buf = (ctypes.c_uint8 * size.value)()
-                bytes_read = ctypes.c_int64()
+                bytes_read = ctypes.c_int32()
                 lib.objstore_read(
                     handle, ctypes.c_uint64(obj_id), ctypes.c_int64(0),
-                    buf, ctypes.c_int64(size.value), ctypes.byref(bytes_read)
+                    buf, ctypes.c_int32(size.value), ctypes.byref(bytes_read)
                 )
                 total_read += bytes_read.value
 

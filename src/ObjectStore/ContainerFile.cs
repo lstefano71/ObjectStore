@@ -56,8 +56,14 @@ public sealed class ContainerFile : IDisposable
     {
         if (offset + buffer.Length > _fileSize)
         {
-            buffer.Clear();
-            return;
+            // Another process may have extended the file since our last RefreshFileSize().
+            // Re-read the actual size before concluding the offset is out of bounds.
+            _fileSize = _stream.Length;
+            if (offset + buffer.Length > _fileSize)
+            {
+                buffer.Clear();
+                return;
+            }
         }
         _stream.Seek(offset, SeekOrigin.Begin);
         _stream.ReadExactly(buffer);

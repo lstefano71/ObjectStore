@@ -493,4 +493,83 @@ public class ConcurrencyTests : IDisposable
         engine.Append(id, new byte[1000]);
         Assert.Equal(1000, engine.GetInfo(id)!.Size);
     }
+
+    [Fact]
+    public void MultiHandle_InterleavedCreateAndAppend_NoDataLoss()
+    {
+        // Reproduce the multi-process race: two handles interleave create+append
+        using var creator = ObjectEngine.Create(_path);
+        creator.Dispose();
+
+        using var engineA = ObjectEngine.Open(_path);
+        using var engineB = ObjectEngine.Open(_path);
+
+        // Engine A creates an object
+        ulong idA = engineA.CreateObject("obj_a");
+
+        // Engine B creates an object (acquires lock, refreshes, sees A's commit)
+        ulong idB = engineB.CreateObject("obj_b");
+
+        // Engine A tries to append — must refresh and still find its object
+        engineA.Append(idA, new byte[] { 1, 2, 3, 4 });
+
+        // Engine B tries to append
+        engineB.Append(idB, new byte[] { 5, 6, 7, 8 });
+
+        // Verify both exist and have correct data
+        engineA.Refresh();
+        Assert.True(engineA.Exists(idA));
+        Assert.True(engineA.Exists(idB));
+        Assert.Equal(4, engineA.GetInfo(idA)!.Size);
+        Assert.Equal(4, engineA.GetInfo(idB)!.Size);
+    }
+
+    [Fact]
+    public void MultiHandle_ManyInterleavedOps_NoDataLoss()
+    {
+        // Stress test: 8 handles each creating 10 objects with interleaved creates and appends
+        using var creator = ObjectEngine.Create(_path);
+        creator.Dispose();
+
+        const int numHandles = 8;
+        const int opsPerHandle = 10;
+        var engines = new ObjectEngine[numHandles];
+        for (int i = 0; i < numHandles; i++)
+            engines[i] = ObjectEngine.Open(_path);
+
+        var createdIds = new ulong[numHandles, opsPerHandle];
+
+        // Interleave: all handles create their first object, then all create second, etc.
+        for (int op = 0; op < opsPerHandle; op++)
+        {
+            for (int h = 0; h < numHandles; h++)
+            {
+                createdIds[h, op] = engines[h].CreateObject($"h{h}_op{op}");
+            }
+        }
+
+        // Now all handles append to their objects
+        for (int op = 0; op < opsPerHandle; op++)
+        {
+            for (int h = 0; h < numHandles; h++)
+            {
+                var data = Encoding.UTF8.GetBytes($"data_h{h}_op{op}");
+                engines[h].Append(createdIds[h, op], data);
+            }
+        }
+
+        // Verify all objects exist
+        engines[0].Refresh();
+        for (int h = 0; h < numHandles; h++)
+        {
+            for (int op = 0; op < opsPerHandle; op++)
+            {
+                Assert.True(engines[0].Exists(createdIds[h, op]),
+                    $"Object h={h} op={op} id={createdIds[h, op]} not found!");
+            }
+        }
+
+        for (int i = 0; i < numHandles; i++)
+            engines[i].Dispose();
+    }
 }
