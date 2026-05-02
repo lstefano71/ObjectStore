@@ -10,27 +10,31 @@ public sealed class ObjectEngine : IDisposable
     private readonly ContainerFile _file;
     private readonly BuddyAllocator _allocator;
     private BTree _tree;
+    private BTree _idTree; // Secondary B-tree: keyed by (0, objectId), value = serialized primary BTreeKey
     private readonly SuperblockManager _sbManager;
     private ulong _nextNodeId;
     private readonly TransactionManager _txn;
     private readonly bool _readOnly;
     private int _lastBuddyBlockOrder; // order of the last committed buddy state block
+    private Dictionary<ulong, BTreeKey>? _idTreeFallback; // read-only migration fallback
 
     public ContainerFile File => _file;
     public BuddyAllocator Allocator => _allocator;
     public BTree Tree => _tree;
+    public BTree IdTree => _idTree;
     public ulong NextNodeId => _nextNodeId;
     public TransactionManager Transactions => _txn;
     internal SuperblockManager SuperblockManager => _sbManager;
     public bool IsReadOnly => _readOnly;
 
     private ObjectEngine(ContainerFile file, BuddyAllocator allocator, BTree tree,
-                         SuperblockManager sbManager, ulong nextNodeId, bool readOnly = false,
-                         int lastBuddyBlockOrder = 0)
+                         BTree idTree, SuperblockManager sbManager, ulong nextNodeId,
+                         bool readOnly = false, int lastBuddyBlockOrder = 0)
     {
         _file = file;
         _allocator = allocator;
         _tree = tree;
+        _idTree = idTree;
         _sbManager = sbManager;
         _nextNodeId = nextNodeId;
         _txn = new TransactionManager(this);
@@ -46,6 +50,7 @@ public sealed class ObjectEngine : IDisposable
 
         var allocator = new BuddyAllocator(file, FormatConstants.DataRegionOffset);
         var tree = new BTree(allocator, file);
+        var idTree = new BTree(allocator, file);
         var sbManager = new SuperblockManager(file);
 
         var sb = new Superblock
@@ -58,7 +63,7 @@ public sealed class ObjectEngine : IDisposable
         };
         sbManager.Initialize(sb);
 
-        return new ObjectEngine(file, allocator, tree, sbManager, 2);
+        return new ObjectEngine(file, allocator, tree, idTree, sbManager, 2);
     }
 
     /// <summary>Opens an existing container.</summary>
@@ -86,8 +91,13 @@ public sealed class ObjectEngine : IDisposable
         }
 
         var tree = new BTree(allocator, file, (long)active.BTreeRootAddress);
-        var engine = new ObjectEngine(file, allocator, tree, sbManager, active.NextNodeId,
+        var idTree = new BTree(allocator, file, (long)active.IdIndexRootAddress);
+        var engine = new ObjectEngine(file, allocator, tree, idTree, sbManager, active.NextNodeId,
             lastBuddyBlockOrder: lastBuddyOrder);
+
+        // Migration: if no ID index exists, rebuild from primary tree
+        if (active.IdIndexRootAddress == 0 && active.BTreeRootAddress != 0)
+            engine.RebuildIdIndex();
 
         // Set dirty flag on open (cleared on clean close)
         engine.SetDirtyFlag(true);
@@ -118,7 +128,13 @@ public sealed class ObjectEngine : IDisposable
         }
 
         var tree = new BTree(allocator, file, (long)active.BTreeRootAddress);
-        return new ObjectEngine(file, allocator, tree, sbManager, active.NextNodeId, readOnly: true);
+        var idTree = new BTree(allocator, file, (long)active.IdIndexRootAddress);
+
+        // Migration for read-only: rebuild in memory (won't persist but enables lookups)
+        var engine = new ObjectEngine(file, allocator, tree, idTree, sbManager, active.NextNodeId, readOnly: true);
+        if (active.IdIndexRootAddress == 0 && active.BTreeRootAddress != 0)
+            engine.RebuildIdIndexReadOnly();
+        return engine;
     }
 
     /// <summary>Opens or creates a container.</summary>
@@ -148,6 +164,7 @@ public sealed class ObjectEngine : IDisposable
         }
 
         _tree = new BTree(_allocator, _file, (long)active.BTreeRootAddress, _tree.Order);
+        _idTree = new BTree(_allocator, _file, (long)active.IdIndexRootAddress, _idTree.Order);
         _nextNodeId = active.NextNodeId;
     }
 
@@ -173,6 +190,11 @@ public sealed class ObjectEngine : IDisposable
 
         var key = new BTreeKey(record.ParentId, record.NameHash != 0 ? record.NameHash : id);
         _tree.Insert(key, record.Serialize());
+
+        // Insert into ID index: key=(0, id), value=serialized primary key
+        var idKey = new BTreeKey(0, id);
+        _idTree.Insert(idKey, key.Serialize());
+
         AutoCommit();
         return id;
     }
@@ -194,6 +216,7 @@ public sealed class ObjectEngine : IDisposable
         }
 
         _tree.Delete(key);
+        _idTree.Delete(new BTreeKey(0, id));
         AutoCommit();
         return true;
     }
@@ -246,7 +269,7 @@ public sealed class ObjectEngine : IDisposable
                 data.Slice(dataOffset, toFill).CopyTo(blockData.AsSpan(lastBlockUsed));
 
                 // COW: allocate new block, write merged data, free old
-                long newAddr = _allocator.Allocate(lastOrder);
+                long newAddr = AllocateTracked(lastOrder);
                 _file.WriteBlock(newAddr, lastOrder, blockData.AsSpan(0, lastBlockUsed + toFill));
                 DeferredFree(lastAddr, lastOrder);
                 extents.Extents[lastIdx] = (newAddr, lastOrder);
@@ -263,8 +286,7 @@ public sealed class ObjectEngine : IDisposable
             int capacity = FormatConstants.PayloadSizeForOrder(order);
             int toWrite = Math.Min(remaining, capacity);
 
-            long blockAddr = _allocator.Allocate(order);
-            _file.WriteBlock(blockAddr, order, data.Slice(dataOffset, toWrite));
+            long blockAddr = AllocateTracked(order);            _file.WriteBlock(blockAddr, order, data.Slice(dataOffset, toWrite));
             extents.Extents.Add((blockAddr, order));
 
             dataOffset += toWrite;
@@ -351,7 +373,7 @@ public sealed class ObjectEngine : IDisposable
                     byte[] blockData = _file.ReadBlock(addr, order);
                     data.Slice(srcStart, toWrite).CopyTo(blockData.AsSpan(skipInExtent));
 
-                    long newAddr = _allocator.Allocate(order);
+                    long newAddr = AllocateTracked(order);
                     _file.WriteBlock(newAddr, order, blockData);
                     DeferredFree(addr, order);
                     extents.Extents[i] = (newAddr, order);
@@ -434,6 +456,9 @@ public sealed class ObjectEngine : IDisposable
         var key = new BTreeKey(record.ParentId, record.NameHash);
         _tree.Insert(key, record.Serialize());
 
+        // Insert into ID index
+        _idTree.Insert(new BTreeKey(0, id), key.Serialize());
+
         // Update parent's child count
         UpdateChildCount(parentId, 1);
 
@@ -470,6 +495,9 @@ public sealed class ObjectEngine : IDisposable
         var newKey = new BTreeKey(record.ParentId, record.NameHash);
         _tree.Insert(newKey, record.Serialize());
 
+        // Update ID index to point to the new primary key
+        _idTree.Update(new BTreeKey(0, nodeId), newKey.Serialize());
+
         // Update child counts
         UpdateChildCount(oldParentId, -1);
         UpdateChildCount(newParentId, 1);
@@ -496,11 +524,13 @@ public sealed class ObjectEngine : IDisposable
         {
             FreeNodeData(rec);
             _tree.Delete(key);
+            _idTree.Delete(new BTreeKey(0, rec.Id));
         }
 
         // Delete the node itself
         FreeNodeData(nodeRecord);
         _tree.Delete(nodeKey);
+        _idTree.Delete(new BTreeKey(0, nodeId));
 
         // Update parent's child count
         UpdateChildCount(parentId, -1);
@@ -635,6 +665,7 @@ public sealed class ObjectEngine : IDisposable
         _lastBuddyBlockOrder = buddyOrder;
 
         sb.BTreeRootAddress = (ulong)_tree.RootAddress;
+        sb.IdIndexRootAddress = (ulong)_idTree.RootAddress;
         sb.BuddyRootAddress = (ulong)buddyAddr;
         sb.ContainerSize = (ulong)_file.FileSize;
         sb.NextNodeId = _nextNodeId;
@@ -645,21 +676,59 @@ public sealed class ObjectEngine : IDisposable
         _sbManager.Commit(sb);
 
         // Free old B-tree nodes that were replaced by COW mutations
-        // Safe to free after commit since the superblock now points to the new tree
-        int nodeOrder = _tree.Order; // B-tree node block order
+        // Safe to free after commit since the superblock now points to the new trees
         foreach (long freedAddr in _tree.FreedBlocks)
             _allocator.Free(freedAddr, GetBlockOrderFromHeader(freedAddr));
         _tree.FreedBlocks.Clear();
+
+        foreach (long freedAddr in _idTree.FreedBlocks)
+            _allocator.Free(freedAddr, GetBlockOrderFromHeader(freedAddr));
+        _idTree.FreedBlocks.Clear();
     }
 
-    /// <summary>Restores B-tree root (used by TransactionManager on rollback).</summary>
+    /// <summary>Restores B-tree roots (used by TransactionManager on rollback).</summary>
     internal void RestoreRootAddress(long address)
     {
         _tree = new BTree(_allocator, _file, address, _tree.Order);
     }
 
+    /// <summary>Restores ID index tree root (used by TransactionManager on rollback).</summary>
+    internal void RestoreIdTreeRootAddress(long address)
+    {
+        _idTree = new BTree(_allocator, _file, address, _idTree.Order);
+    }
+
     /// <summary>Restores the next node ID counter (used by TransactionManager on rollback).</summary>
     internal void RestoreNextNodeId(ulong id) => _nextNodeId = id;
+
+    /// <summary>Rebuilds the ID index from the primary tree (one-time migration). Commits the result.</summary>
+    private void RebuildIdIndex()
+    {
+        foreach (var (key, value) in _tree.ScanAll())
+        {
+            var record = NodeRecord.Deserialize(value);
+            _idTree.Insert(new BTreeKey(0, record.Id), key.Serialize());
+        }
+        CommitInternal();
+    }
+
+    /// <summary>Rebuilds the ID index in memory only (for read-only mode migration).</summary>
+    private void RebuildIdIndexReadOnly()
+    {
+        // In read-only mode we can't persist, but we can build the tree in memory
+        // using temporary allocations. The tree writes go to the file but since
+        // it's read-only logically, we just build the mapping in a local dictionary
+        // and override FindById to use it. However, since our BTree always writes to
+        // disk, for truly read-only we fall back to the scan approach.
+        // For simplicity: just rebuild in memory — the tree will allocate blocks but
+        // since the file is opened read-only, this will throw. Instead, use a fallback.
+        _idTreeFallback = new Dictionary<ulong, BTreeKey>();
+        foreach (var (key, value) in _tree.ScanAll())
+        {
+            var record = NodeRecord.Deserialize(value);
+            _idTreeFallback[record.Id] = key;
+        }
+    }
 
     // --- Metadata ---
 
@@ -723,7 +792,7 @@ public sealed class ObjectEngine : IDisposable
         if (oldAddress != 0)
             DeferredFreeExtentListBlock(oldAddress); // reuses the same free helper
 
-        long addr = _allocator.Allocate(order);
+        long addr = AllocateTracked(order);
         _file.WriteBlock(addr, order, data);
         return addr;
     }
@@ -812,15 +881,40 @@ public sealed class ObjectEngine : IDisposable
             _allocator.Free(address, order);
     }
 
+    /// <summary>
+    /// Allocates a block and tracks it in the active transaction for rollback.
+    /// </summary>
+    private long AllocateTracked(int order)
+    {
+        long addr = _allocator.Allocate(order);
+        if (_txn.HasActiveTransaction)
+            _txn.TrackNewBlock(addr, order);
+        return addr;
+    }
+
     private (BTreeKey Key, NodeRecord? Record) FindById(ulong id)
     {
-        foreach (var (key, value) in _tree.ScanAll())
+        // Read-only migration fallback (in-memory dictionary)
+        if (_idTreeFallback != null)
         {
-            var record = NodeRecord.Deserialize(value);
-            if (record.Id == id)
-                return (key, record);
+            if (!_idTreeFallback.TryGetValue(id, out var primaryKey))
+                return (default, null);
+            var val = _tree.Get(primaryKey);
+            return val == null ? (default, null) : (primaryKey, NodeRecord.Deserialize(val));
         }
-        return (default, null);
+
+        // Use secondary ID index: key=(0, id), value=serialized primary BTreeKey
+        var idKey = new BTreeKey(0, id);
+        var primaryKeyData = _idTree.Get(idKey);
+        if (primaryKeyData == null)
+            return (default, null);
+
+        var pKey = BTreeKey.ReadFrom(primaryKeyData);
+        var value = _tree.Get(pKey);
+        if (value == null)
+            return (default, null);
+
+        return (pKey, NodeRecord.Deserialize(value));
     }
 
     private ExtentList LoadExtentList(NodeRecord record)
@@ -862,7 +956,7 @@ public sealed class ObjectEngine : IDisposable
             DeferredFreeExtentListBlock(oldAddress);
         }
 
-        long addr = _allocator.Allocate(order);
+        long addr = AllocateTracked(order);
         _file.WriteBlock(addr, order, data);
         return addr;
     }

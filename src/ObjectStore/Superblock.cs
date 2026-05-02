@@ -35,6 +35,9 @@ public struct Superblock
     /// <summary>Root node ID (always 1 after initial creation).</summary>
     public ulong RootNodeId;
 
+    /// <summary>Block address of the secondary ID-index B-tree root.</summary>
+    public ulong IdIndexRootAddress;
+
     // Flag bit constants
     public const uint FlagEncryptionEnabled = 0x01;
     public const uint FlagDirtyOpen = 0x02;
@@ -92,6 +95,10 @@ public struct Superblock
 
         // RootNodeId
         BinaryPrimitives.WriteUInt64LittleEndian(buffer[offset..], RootNodeId);
+        offset += 8;
+
+        // IdIndexRootAddress
+        BinaryPrimitives.WriteUInt64LittleEndian(buffer[offset..], IdIndexRootAddress);
         offset += 8;
 
         // Checksum at the last 8 bytes (offset 504..512)
@@ -152,6 +159,9 @@ public struct Superblock
         offset += 8;
 
         sb.RootNodeId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
+        offset += 8;
+
+        sb.IdIndexRootAddress = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
 
         return true;
     }

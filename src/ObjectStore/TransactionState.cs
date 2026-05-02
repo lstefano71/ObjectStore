@@ -12,6 +12,9 @@ public sealed class TransactionState
     /// <summary>B-tree root address at the start of this transaction/savepoint.</summary>
     public long OriginalRootAddress { get; set; }
 
+    /// <summary>ID index tree root address at the start of this transaction.</summary>
+    public long OriginalIdTreeRootAddress { get; set; }
+
     /// <summary>Working B-tree root address (updated as mutations occur).</summary>
     public long WorkingRootAddress { get; set; }
 
@@ -39,6 +42,7 @@ public sealed class TransactionState
 public sealed class SavepointState
 {
     public long RootAddress { get; set; }
+    public long IdTreeRootAddress { get; set; }
     public List<long>[] AllocatorSnapshot { get; set; } = [];
     public long AllocatorDataRegionEnd { get; set; }
     public int AllocatorFreeBlockCount { get; set; }

@@ -27,6 +27,7 @@ public sealed class TransactionManager
             {
                 Depth = 1,
                 OriginalRootAddress = _engine.Tree.RootAddress,
+                OriginalIdTreeRootAddress = _engine.IdTree.RootAddress,
                 WorkingRootAddress = _engine.Tree.RootAddress,
                 AllocatorSnapshot = freeLists,
                 AllocatorDataRegionEnd = dataEnd,
@@ -41,6 +42,7 @@ public sealed class TransactionManager
             var sp = new SavepointState
             {
                 RootAddress = _engine.Tree.RootAddress,
+                IdTreeRootAddress = _engine.IdTree.RootAddress,
                 AllocatorSnapshot = freeLists,
                 AllocatorDataRegionEnd = dataEnd,
                 AllocatorFreeBlockCount = freeCount,
@@ -102,15 +104,16 @@ public sealed class TransactionManager
             _engine.Allocator.RestoreFromSnapshot(sp.AllocatorSnapshot,
                 sp.AllocatorDataRegionEnd, sp.AllocatorFreeBlockCount);
             _engine.RestoreRootAddress(sp.RootAddress);
+            _engine.RestoreIdTreeRootAddress(sp.IdTreeRootAddress);
             _engine.RestoreNextNodeId(sp.NextNodeId);
         }
         else
         {
             // Full rollback to beginning of transaction
-            // Restore allocator state from snapshot (this undoes all allocations)
             _engine.Allocator.RestoreFromSnapshot(_current.AllocatorSnapshot,
                 _current.AllocatorDataRegionEnd, _current.AllocatorFreeBlockCount);
             _engine.RestoreRootAddress(_current.OriginalRootAddress);
+            _engine.RestoreIdTreeRootAddress(_current.OriginalIdTreeRootAddress);
             _engine.RestoreNextNodeId(_current.OriginalNextNodeId);
 
             _current = null;

@@ -22,6 +22,13 @@ public readonly record struct BTreeKey(ulong ParentId, ulong NameHash) : ICompar
         BinaryPrimitives.WriteUInt64LittleEndian(buffer[8..], NameHash);
     }
 
+    public byte[] Serialize()
+    {
+        var buf = new byte[Size];
+        WriteTo(buf);
+        return buf;
+    }
+
     public static BTreeKey ReadFrom(ReadOnlySpan<byte> buffer)
     {
         ulong parentId = BinaryPrimitives.ReadUInt64LittleEndian(buffer);
