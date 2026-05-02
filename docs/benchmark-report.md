@@ -272,6 +272,70 @@ See Section 9 for the full before/after comparison.
 | Python | `--lib PATH` | Override native DLL path |
 | C# | `BENCH_TMPDIR` env var | Place temp DB files on a specific disk |
 | C# | `--filter "Name"` | Run specific benchmark subset |
+| Comparison | `benchmark_sqlite_comparison.py` | Side-by-side ObjectStore vs SQLite |
+
+---
+
+## 10. ObjectStore vs SQLite Comparison
+
+**Date:** 2026-05-02  
+**SQLite version:** Python 3.14 built-in sqlite3 module  
+**SQLite config:** WAL mode, `synchronous=FULL` (matches ObjectStore's fsync-on-commit)  
+**Disk:** SSD (C:)
+
+### 10.1 Methodology
+
+A minimal object store was implemented using Python + SQLite (`tests/python/sqlite_object_store.py`) with the same operations: create, append, read, delete, begin/commit transaction. Both backends were benchmarked with identical workloads called from the same Python script.
+
+**Important context:**
+- SQLite's Python binding is a built-in C extension (zero FFI overhead for queries)
+- ObjectStore is called via ctypes FFI (DLL load + function call + buffer marshaling per operation)
+- SQLite WAL mode appends writes sequentially to the WAL; ObjectStore does scattered COW block writes
+- Both use `synchronous=FULL` ensuring data is fsynced on every commit
+
+### 10.2 Results (SSD, Quick Mode)
+
+| Scenario | ObjectStore | SQLite | SQLite Advantage |
+|----------|------------:|-------:|-----------------:|
+| **Sequential Write (256B)** | 187/s | 475/s | 2.5× |
+| **Sequential Write (64KB)** | 59/s | 228/s | 3.9× |
+| **Sequential Read (256B)** | 21,169/s | 107,388/s | 5.1× |
+| **Sequential Read (64KB)** | 294/s | 10,462/s | 35.6× |
+| **Transaction Batch (200×256B)** | 1,835/s | 62,334/s | 34.0× |
+| **Concurrent Write (1w)** | 64/s | 94/s | 1.5× |
+| **Concurrent Write (2w)** | 99/s | 135/s | 1.4× |
+| **Concurrent Write (4w)** | 118/s | 197/s | 1.7× |
+| **Concurrent Read (1r)** | 1,080/s | 1,277/s | 1.2× |
+| **Concurrent Read (2r)** | 2,007/s | 1,970/s | **ObjectStore wins** |
+| **Concurrent Read (4r)** | 2,705/s | 3,421/s | 1.3× |
+| **Mixed 20W/80R (4w)** | 226/s | 308/s | 1.4× |
+| **Mixed 50W/50R (4w)** | 166/s | 241/s | 1.5× |
+
+### 10.3 Analysis
+
+**Where SQLite dominates (30-35×):**
+- **Transaction batches:** SQLite WAL mode appends all changes sequentially to one file, then syncs once. ObjectStore must write multiple scattered COW B-tree blocks + allocator state + superblock, each at different file offsets.
+- **Large reads (64KB):** SQLite returns the BLOB directly from its page cache via its C extension. ObjectStore requires FFI → read blocks → copy to ctypes buffer → copy to Python bytes (multiple hops).
+
+**Where the gap is moderate (2-5×):**
+- **Sequential writes:** Both are fsync-bound, but SQLite's WAL append is cheaper than our COW multi-block write. The 2.5× gap for small writes reflects our overhead of updating two B-trees + allocator per commit.
+- **Small reads:** The 5× gap is primarily Python FFI overhead (ctypes call + 1MB pre-allocated buffer copy) vs SQLite's native C binding.
+
+**Where they're roughly equal (1-1.7×):**
+- **Multi-process workloads:** When process-spawn and file-locking overhead dominate, both engines converge. ObjectStore even ties SQLite at 2 concurrent readers.
+
+**Key takeaways:**
+1. SQLite's 30+ year optimization history shows — it's extremely hard to beat for simple CRUD workloads
+2. ObjectStore's primary value propositions (crash-safe COW semantics, buddy allocator, MVCC, extensible B-tree) add overhead vs SQLite's simpler page-based design
+3. The FFI tax is significant — calling a native DLL from Python via ctypes adds ~5× overhead vs SQLite's built-in C extension binding
+4. For multi-process locking-dominated workloads, both converge (lock + fsync cost dominates everything else)
+5. ObjectStore would compare more favorably from C/C++/Rust (no FFI overhead) or in scenarios where its COW/MVCC features provide value that SQLite cannot
+
+### 10.4 Run Command
+
+```bash
+python tests/python/benchmark_sqlite_comparison.py --tmpdir C:\temp --quick
+```
 
 ---
 
