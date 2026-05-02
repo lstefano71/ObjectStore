@@ -136,7 +136,7 @@ public sealed class BTree
     {
         byte[] data = node.Serialize();
         long address = _allocator.Allocate(_nodeBlockOrder);
-        _file.WriteBlock(address, _nodeBlockOrder, data);
+        _file.WriteBlockOwned(address, _nodeBlockOrder, data);
         node.Address = address;
         return address;
     }

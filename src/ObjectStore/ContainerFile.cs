@@ -104,13 +104,17 @@ public sealed class ContainerFile : IDisposable
     }
 
     /// <summary>
-    /// Reads a block and returns a mutable copy (not shared with cache).
+    /// Reads a block and returns a mutable buffer sized to full payload capacity.
     /// Use this when you need to modify the data (e.g., COW append/write-at).
+    /// The returned buffer may be larger than the stored payload (zero-padded).
     /// </summary>
     public byte[] ReadBlockMutable(long address, int order)
     {
         byte[] shared = ReadBlock(address, order);
-        return (byte[])shared.Clone();
+        int payloadCapacity = FormatConstants.BlockSizeForOrder(order) - FormatConstants.BlockHeaderSize;
+        byte[] mutable = new byte[payloadCapacity];
+        shared.CopyTo(mutable, 0);
+        return mutable;
     }
 
     /// <summary>
@@ -136,13 +140,39 @@ public sealed class ContainerFile : IDisposable
             System.Buffers.ArrayPool<byte>.Shared.Return(raw);
         }
 
-        // Cache the full payload area (zero-padded) to match what ReadBlock returns
+        // Cache the actual payload (not the full block capacity — ReadBlock does the same)
         if (_blockCache != null)
         {
-            byte[] cachedPayload = new byte[payloadCapacity];
+            byte[] cachedPayload = new byte[payload.Length];
             payload.CopyTo(cachedPayload);
             _blockCache.Put(address, cachedPayload);
         }
+    }
+
+    /// <summary>
+    /// Writes a block and takes ownership of the payload array for caching (no copy).
+    /// The caller must not use the array after this call.
+    /// </summary>
+    public void WriteBlockOwned(long address, int order, byte[] ownedPayload, byte flags = FormatConstants.BlockFlagInUse)
+    {
+        int blockSize = FormatConstants.BlockSizeForOrder(order);
+        int payloadCapacity = blockSize - FormatConstants.BlockHeaderSize;
+
+        if (ownedPayload.Length > payloadCapacity)
+            throw new ArgumentException($"Payload ({ownedPayload.Length}) exceeds block capacity ({payloadCapacity}).");
+
+        byte[] raw = System.Buffers.ArrayPool<byte>.Shared.Rent(blockSize);
+        try
+        {
+            BlockHeader.WriteBlock(raw.AsSpan(0, blockSize), ownedPayload, flags);
+            WriteRaw(address, raw.AsSpan(0, blockSize));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(raw);
+        }
+
+        _blockCache?.Put(address, ownedPayload);
     }
 
     /// <summary>Invalidates a cached block (e.g., when freed).</summary>
