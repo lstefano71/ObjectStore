@@ -310,3 +310,99 @@ class TestPhase3Objects:
             assert rc == 0
             assert buf.raw == expected
 
+
+# ============================================================
+# Phase 4 Tests — Transactions
+# ============================================================
+
+class TestPhase4Transactions:
+    @pytest.fixture(autouse=True)
+    def setup_store(self, lib):
+        self.path = _temp_path()
+        self.handle = ctypes.c_void_p()
+        rc = lib.objstore_create(self.path.encode("utf-8"), None, ctypes.byref(self.handle))
+        assert rc == 0
+        yield
+        lib.objstore_close(self.handle)
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_txn_commit_persists(self, lib):
+        rc = lib.objstore_txn_begin(self.handle)
+        assert rc == 0
+
+        obj_id = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"txn-obj", ctypes.byref(obj_id))
+        data = b"transaction data"
+        lib.objstore_append(self.handle, obj_id, data, len(data))
+
+        rc = lib.objstore_txn_commit(self.handle)
+        assert rc == 0
+
+        # Verify exists
+        exists = ctypes.c_int32()
+        lib.objstore_object_exists(self.handle, obj_id, ctypes.byref(exists))
+        assert exists.value == 1
+
+    def test_txn_rollback_reverts(self, lib):
+        rc = lib.objstore_txn_begin(self.handle)
+        assert rc == 0
+
+        obj_id = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"rollback-obj", ctypes.byref(obj_id))
+        data = b"will be rolled back"
+        lib.objstore_append(self.handle, obj_id, data, len(data))
+
+        rc = lib.objstore_txn_rollback(self.handle)
+        assert rc == 0
+
+        # Verify gone
+        exists = ctypes.c_int32()
+        lib.objstore_object_exists(self.handle, obj_id, ctypes.byref(exists))
+        assert exists.value == 0
+
+    def test_txn_rollback_preserves_preexisting(self, lib):
+        # Create an object before transaction
+        obj_id = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"pre-obj", ctypes.byref(obj_id))
+        data = b"keep this"
+        lib.objstore_append(self.handle, obj_id, data, len(data))
+
+        # Start transaction, create another, rollback
+        lib.objstore_txn_begin(self.handle)
+        obj_id2 = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"discard-obj", ctypes.byref(obj_id2))
+        lib.objstore_txn_rollback(self.handle)
+
+        # Pre-existing object still there
+        exists = ctypes.c_int32()
+        lib.objstore_object_exists(self.handle, obj_id, ctypes.byref(exists))
+        assert exists.value == 1
+
+        buf = ctypes.create_string_buffer(len(data))
+        bytes_read = ctypes.c_int32()
+        lib.objstore_read(self.handle, obj_id, ctypes.c_int64(0),
+                          buf, len(data), ctypes.byref(bytes_read))
+        assert buf.raw == data
+
+    def test_nested_savepoint(self, lib):
+        lib.objstore_txn_begin(self.handle)
+        obj_id1 = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"outer-obj", ctypes.byref(obj_id1))
+
+        # Nested
+        lib.objstore_txn_begin(self.handle)
+        obj_id2 = ctypes.c_uint64()
+        lib.objstore_object_create(self.handle, b"inner-obj", ctypes.byref(obj_id2))
+        lib.objstore_txn_rollback(self.handle)  # rollback inner only
+
+        lib.objstore_txn_commit(self.handle)  # commit outer
+
+        # Outer object exists, inner doesn't
+        exists1 = ctypes.c_int32()
+        lib.objstore_object_exists(self.handle, obj_id1, ctypes.byref(exists1))
+        assert exists1.value == 1
+
+        exists2 = ctypes.c_int32()
+        lib.objstore_object_exists(self.handle, obj_id2, ctypes.byref(exists2))
+        assert exists2.value == 0

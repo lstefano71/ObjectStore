@@ -2,8 +2,8 @@ namespace ObjectStore;
 
 /// <summary>
 /// Core object storage engine. Manages objects within the container using
-/// the buddy allocator and B-tree. No transaction logic — each operation
-/// is auto-committed (committed immediately).
+/// the buddy allocator and B-tree. Supports explicit transactions with
+/// savepoint nesting. Operations auto-commit when no explicit transaction is active.
 /// </summary>
 public sealed class ObjectEngine : IDisposable
 {
@@ -12,10 +12,13 @@ public sealed class ObjectEngine : IDisposable
     private BTree _tree;
     private readonly SuperblockManager _sbManager;
     private ulong _nextNodeId;
+    private readonly TransactionManager _txn;
 
     public ContainerFile File => _file;
     public BuddyAllocator Allocator => _allocator;
     public BTree Tree => _tree;
+    public ulong NextNodeId => _nextNodeId;
+    public TransactionManager Transactions => _txn;
 
     private ObjectEngine(ContainerFile file, BuddyAllocator allocator, BTree tree,
                          SuperblockManager sbManager, ulong nextNodeId)
@@ -25,6 +28,7 @@ public sealed class ObjectEngine : IDisposable
         _tree = tree;
         _sbManager = sbManager;
         _nextNodeId = nextNodeId;
+        _txn = new TransactionManager(this);
     }
 
     /// <summary>Creates a new container.</summary>
@@ -106,7 +110,7 @@ public sealed class ObjectEngine : IDisposable
 
         var key = new BTreeKey(record.ParentId, record.NameHash != 0 ? record.NameHash : id);
         _tree.Insert(key, record.Serialize());
-        Commit();
+        AutoCommit();
         return id;
     }
 
@@ -121,12 +125,12 @@ public sealed class ObjectEngine : IDisposable
         {
             var extents = LoadExtentList(record);
             foreach (var (addr, order) in extents.Extents)
-                _allocator.Free(addr, order);
-            FreeExtentListBlock(record.ExtentListAddress);
+                DeferredFree(addr, order);
+            DeferredFreeExtentListBlock(record.ExtentListAddress);
         }
 
         _tree.Delete(key);
-        Commit();
+        AutoCommit();
         return true;
     }
 
@@ -179,7 +183,7 @@ public sealed class ObjectEngine : IDisposable
                 // COW: allocate new block, write merged data, free old
                 long newAddr = _allocator.Allocate(lastOrder);
                 _file.WriteBlock(newAddr, lastOrder, blockData.AsSpan(0, lastBlockUsed + toFill));
-                _allocator.Free(lastAddr, lastOrder);
+                DeferredFree(lastAddr, lastOrder);
                 extents.Extents[lastIdx] = (newAddr, lastOrder);
 
                 dataOffset += toFill;
@@ -208,7 +212,7 @@ public sealed class ObjectEngine : IDisposable
         record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         _tree.Update(key, record.Serialize());
-        Commit();
+        AutoCommit();
     }
 
     /// <summary>Reads data from an object at the given offset.</summary>
@@ -285,7 +289,7 @@ public sealed class ObjectEngine : IDisposable
 
                     long newAddr = _allocator.Allocate(order);
                     _file.WriteBlock(newAddr, order, blockData);
-                    _allocator.Free(addr, order);
+                    DeferredFree(addr, order);
                     extents.Extents[i] = (newAddr, order);
                     remaining -= toWrite;
                 }
@@ -297,7 +301,7 @@ public sealed class ObjectEngine : IDisposable
         record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
         record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         _tree.Update(key, record.Serialize());
-        Commit();
+        AutoCommit();
     }
 
     /// <summary>Truncates an object to the specified length.</summary>
@@ -317,7 +321,7 @@ public sealed class ObjectEngine : IDisposable
 
             if (extentStart >= newLength)
             {
-                _allocator.Free(extents.Extents[i].Address, extents.Extents[i].Order);
+                DeferredFree(extents.Extents[i].Address, extents.Extents[i].Order);
                 extents.Extents.RemoveAt(i);
             }
         }
@@ -326,7 +330,7 @@ public sealed class ObjectEngine : IDisposable
         record.ExtentListAddress = SaveExtentList(extents, record.ExtentListAddress);
         record.Modified = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         _tree.Update(key, record.Serialize());
-        Commit();
+        AutoCommit();
     }
 
     /// <summary>Lists all objects.</summary>
@@ -336,8 +340,26 @@ public sealed class ObjectEngine : IDisposable
             yield return NodeRecord.Deserialize(value);
     }
 
-    /// <summary>Commits current state to the superblock.</summary>
-    public void Commit()
+    // --- Transaction support methods ---
+
+    /// <summary>Begins an explicit transaction.</summary>
+    public void BeginTransaction() => _txn.Begin();
+
+    /// <summary>Commits the current transaction.</summary>
+    public void CommitTransaction() => _txn.Commit();
+
+    /// <summary>Rolls back the current transaction.</summary>
+    public void RollbackTransaction() => _txn.Rollback();
+
+    /// <summary>Auto-commits if no explicit transaction is active.</summary>
+    private void AutoCommit()
+    {
+        if (!_txn.HasActiveTransaction)
+            CommitInternal();
+    }
+
+    /// <summary>Persists current state to superblock (called by TransactionManager on commit).</summary>
+    internal void CommitInternal()
     {
         // Save buddy state
         byte[] buddyState = _allocator.Serialize();
@@ -355,9 +377,30 @@ public sealed class ObjectEngine : IDisposable
         _tree.FreedBlocks.Clear();
     }
 
+    /// <summary>Restores B-tree root (used by TransactionManager on rollback).</summary>
+    internal void RestoreRootAddress(long address)
+    {
+        _tree = new BTree(_allocator, _file, address, _tree.Order);
+    }
+
+    /// <summary>Restores the next node ID counter (used by TransactionManager on rollback).</summary>
+    internal void RestoreNextNodeId(ulong id) => _nextNodeId = id;
+
     public void Dispose()
     {
         _file.Dispose();
+    }
+
+    /// <summary>
+    /// Frees a block. During a transaction, defers the free to commit time
+    /// to avoid corrupting block data (needed for rollback).
+    /// </summary>
+    private void DeferredFree(long address, int order)
+    {
+        if (_txn.HasActiveTransaction)
+            _txn.TrackPendingFree(address, order);
+        else
+            _allocator.Free(address, order);
     }
 
     private (BTreeKey Key, NodeRecord? Record) FindById(ulong id)
@@ -407,8 +450,7 @@ public sealed class ObjectEngine : IDisposable
 
         if (oldAddress != 0)
         {
-            // Free old extent list block - read to determine its size
-            FreeExtentListBlock(oldAddress);
+            DeferredFreeExtentListBlock(oldAddress);
         }
 
         long addr = _allocator.Allocate(order);
@@ -416,9 +458,14 @@ public sealed class ObjectEngine : IDisposable
         return addr;
     }
 
-    private void FreeExtentListBlock(long address)
+    private void DeferredFreeExtentListBlock(long address)
     {
-        // Read the raw block header to determine its order from the stored size
+        int order = GetBlockOrderFromAddress(address);
+        DeferredFree(address, order);
+    }
+
+    private int GetBlockOrderFromAddress(long address)
+    {
         Span<byte> header = stackalloc byte[4];
         _file.ReadRaw(address, header);
         int blockSize = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(header);
@@ -429,6 +476,6 @@ public sealed class ObjectEngine : IDisposable
             order++;
             sz <<= 1;
         }
-        _allocator.Free(address, order);
+        return order;
     }
 }
