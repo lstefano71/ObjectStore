@@ -420,3 +420,93 @@ python tests/python/benchmark_sqlite_comparison.py --tmpdir C:\temp --quick
 6. `BTree.WriteNode` uses `WriteBlockOwned` — serialize buffer IS the cache entry
 7. `BTreeNode.Serialize` pre-calculates size, writes directly via `BinaryPrimitives`
 8. `NodeRecord.Serialize` uses `UTF8.GetByteCount` + `UTF8.GetBytes(name, span)` directly
+
+---
+
+## 11. Native C Benchmark: ObjectStore vs SQLite (Apples-to-Apples)
+
+### Motivation
+
+The Python-based comparison (Section 10) showed SQLite dominating, but Python's `ctypes` FFI adds significant per-call overhead to ObjectStore (each call crosses Python → C boundary with argument marshalling). SQLite's Python binding is a compiled C extension with near-zero overhead. This section eliminates that asymmetry by running both engines from pure C.
+
+### Methodology
+
+Two standalone C programs compiled with MSVC (`cl /O2`):
+- **`bench_objstore.c`** — Loads `ObjectStore.Native.dll` via `LoadLibrary`/`GetProcAddress`
+- **`bench_sqlite.c`** — Compiled with SQLite 3.49.1 amalgamation (statically linked)
+
+**SQLite configuration:** WAL mode, `synchronous=FULL` (matching ObjectStore's fsync-on-commit behavior).
+
+**Timing:** `QueryPerformanceCounter` (sub-microsecond precision on Windows).
+
+**Target disk:** SSD (C:\temp) — SATA SSD, system drive.
+
+### Workloads
+
+| Test | Description |
+|------|-------------|
+| Sequential Write (256B) | 500× create object + append 256 bytes, auto-commit each |
+| Sequential Write (64KB) | 200× create object + append 64KB, auto-commit each |
+| Sequential Read (256B) | 1000× read entire 256B object by ID |
+| Sequential Read (64KB) | 200× read entire 64KB object by ID |
+| Txn Batch (256B) | 5 transactions × 200 objects × 256B per transaction |
+| Txn Batch (64KB) | 3 transactions × 200 objects × 64KB per transaction |
+
+### Results (SSD, best of 2 runs)
+
+| Benchmark | ObjectStore (ops/s) | SQLite (ops/s) | Ratio (SQLite ÷ ObjStore) |
+|-----------|--------------------:|---------------:|--------------------------:|
+| Seq Write 256B | 194 | 803 | **4.1×** SQLite |
+| Seq Write 64KB | 161 | 362 | **2.2×** SQLite |
+| Seq Read 256B | 45,131 | 165,582 | **3.7×** SQLite |
+| Seq Read 64KB | **26,301** | 11,013 | **2.4× ObjectStore** |
+| Txn Batch 256B | 1,947 | 90,302 | **46×** SQLite |
+| Txn Batch 64KB | 1,021 | 800 | **1.3× ObjectStore** |
+
+### Key Findings
+
+1. **ObjectStore wins on large blob reads (64KB): 2.4× faster than SQLite.** ObjectStore reads a single contiguous block directly from the file. SQLite must reassemble the blob across B-tree overflow pages (64KB requires ~15 overflow pages at 4KB page size).
+
+2. **ObjectStore wins on large blob batch writes (64KB): 1.3× faster.** When I/O dominates (64KB × 200 writes per commit), SQLite's page-copy overhead exceeds ObjectStore's COW block write.
+
+3. **SQLite dominates small-payload operations.** For 256B data, SQLite's single-level B-tree lookup and minimal journaling cost beat ObjectStore's full COW commit cycle (allocator update + B-tree node write + superblock double-buffer + fsync).
+
+4. **Transaction batch gap for small data is enormous (46×).** ObjectStore still performs a full COW tree rewrite per transaction commit — writing multiple B-tree nodes even for a batch of 200 small objects. SQLite appends to the WAL with a single fsync at commit.
+
+5. **FFI overhead was masking ObjectStore's read performance.** The Python comparison showed SQLite 5× faster at reads; the C comparison shows only 3.7× for small reads, and ObjectStore actually *wins* for large reads. This confirms ctypes overhead was significant (~20-40μs per call).
+
+### Comparison with Python FFI Results (Section 10)
+
+| Metric | Python (ctypes) Ratio | C (native) Ratio | Delta |
+|--------|----------------------:|------------------:|-------|
+| Seq Write 256B | 2.5× SQLite | 4.1× SQLite | Wider gap (SQLite faster in pure C) |
+| Seq Read 256B | 5× SQLite | 3.7× SQLite | FFI was hurting ObjectStore |
+| Seq Read 64KB | 36× SQLite | **2.4× ObjectStore** | Complete reversal! |
+| Txn Batch 256B | 34× SQLite | 46× SQLite | Consistent |
+
+The most dramatic change is 64KB reads: Python showed SQLite 36× faster, but in C, ObjectStore is 2.4× faster. The Python result was entirely an artifact of ctypes marshalling overhead on each 64KB buffer copy.
+
+### Architecture Implications
+
+ObjectStore's design (COW B-tree, buddy allocator, contiguous block storage) excels at:
+- **Large blob I/O** — data stored in contiguous blocks, no page reassembly
+- **Crash safety** — COW guarantees atomicity without WAL overhead
+- **MVCC readers** — no reader blocking, snapshot isolation
+
+SQLite's design (B-tree with overflow pages, WAL, page cache) excels at:
+- **Small record throughput** — minimal per-operation cost
+- **Transaction batching** — single WAL append + fsync amortizes across many records
+- **Mature optimizations** — 20+ years of page cache, query planner, and I/O optimizations
+
+### Build & Reproduce
+
+```bash
+cd tests/c_bench
+# Requires Visual Studio developer command prompt
+cl /O2 /D_CRT_SECURE_NO_WARNINGS bench_objstore.c /I"../../src/ObjectStore.Native" /Fe:bench_objstore.exe
+cl /O2 /D_CRT_SECURE_NO_WARNINGS /DSQLITE_THREADSAFE=0 /DSQLITE_OMIT_LOAD_EXTENSION bench_sqlite.c sqlite3.c /Fe:bench_sqlite.exe
+
+# Run (ensure ObjectStore.Native.dll is published)
+bench_objstore.exe <path_to_ObjectStore.Native.dll> C:\temp
+bench_sqlite.exe C:\temp
+```

@@ -1,0 +1,8 @@
+sqlite3.c
+sqlite3.h
+sqlite3ext.h
+*.exe
+*.obj
+*.pdb
+sqlite-amalgamation.zip
+
