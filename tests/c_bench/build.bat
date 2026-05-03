@@ -16,7 +16,23 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Building ObjectStore mixed workload benchmark...
+cl /O2 /W3 /nologo bench2_objstore.c /Fe:bench2_objstore.exe
+if errorlevel 1 (
+    echo FAILED to build bench2_objstore.exe
+    exit /b 1
+)
+
+echo Building SQLite mixed workload benchmark...
+cl /O2 /W3 /nologo /DSQLITE_THREADSAFE=0 /DSQLITE_OMIT_LOAD_EXTENSION bench2_sqlite.c sqlite3.c /Fe:bench2_sqlite.exe
+if errorlevel 1 (
+    echo FAILED to build bench2_sqlite.exe
+    exit /b 1
+)
+
 echo.
 echo Build complete. Run:
 echo   bench_objstore.exe ^<path_to_ObjectStore.Native.dll^> [directory]
 echo   bench_sqlite.exe [directory]
+echo   bench2_objstore.exe ^<path_to_ObjectStore.Native.dll^> [directory]
+echo   bench2_sqlite.exe [directory]
