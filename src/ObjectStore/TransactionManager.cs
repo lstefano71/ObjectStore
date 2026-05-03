@@ -121,6 +121,7 @@ public sealed class TransactionManager
             _engine.RestoreRootAddress(sp.RootAddress);
             _engine.RestoreIdTreeRootAddress(sp.IdTreeRootAddress);
             _engine.RestoreNextNodeId(sp.NextNodeId);
+            _engine.IdCacheClear();
 
             // Reset batch tracking (allocator rolled back, old addresses invalid)
             _engine.Tree.EndBatchMode();
@@ -141,6 +142,7 @@ public sealed class TransactionManager
             _engine.RestoreRootAddress(_current.OriginalRootAddress);
             _engine.RestoreIdTreeRootAddress(_current.OriginalIdTreeRootAddress);
             _engine.RestoreNextNodeId(_current.OriginalNextNodeId);
+            _engine.IdCacheClear();
 
             _current = null;
         }

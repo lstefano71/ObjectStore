@@ -43,6 +43,28 @@ public class RecoveryAndDefragTests : IDisposable
     }
 
     [Fact]
+    public void DirtyFlag_ClearFromStaleHandle_PreservesNewerCommit()
+    {
+        using (var engine = ObjectEngine.Create(_path))
+        {
+            engine.CreateObject("original");
+        }
+
+        using var staleHandle = ObjectEngine.Open(_path);
+
+        ulong newerId;
+        using (var writer = ObjectEngine.Open(_path))
+        {
+            newerId = writer.CreateObject("newer");
+        }
+
+        staleHandle.Dispose();
+
+        using var verify = ObjectEngine.Open(_path);
+        Assert.NotNull(verify.GetInfo(newerId));
+    }
+
+    [Fact]
     public void Recovery_AfterCleanClose_NoOp()
     {
         using var db = ObjectStoreDatabase.Create(_path);

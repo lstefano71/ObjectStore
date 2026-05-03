@@ -1161,17 +1161,7 @@ public sealed class ObjectEngine : IDisposable
         {
             try
             {
-                if (!_writeLockHeld)
-                    _file.AcquireWriteLock(_lockTimeout);
-                try
-                {
-                    SetDirtyFlag(false);
-                }
-                finally
-                {
-                    _file.ReleaseWriteLock();
-                    _writeLockHeld = false;
-                }
+                SetDirtyFlag(false);
             }
             catch { /* best-effort */ }
         }
@@ -1179,15 +1169,31 @@ public sealed class ObjectEngine : IDisposable
         _file.Dispose();
     }
 
-    /// <summary>Sets or clears the dirty-open flag and commits the superblock.</summary>
+    /// <summary>Sets or clears the dirty-open flag on the latest committed superblock.</summary>
     internal void SetDirtyFlag(bool dirty)
     {
-        var sb = _sbManager.Active;
-        if (dirty)
-            sb.Flags |= Superblock.FlagDirtyOpen;
-        else
-            sb.Flags &= ~Superblock.FlagDirtyOpen;
-        _sbManager.Commit(sb);
+        bool releaseLock = !_writeLockHeld;
+        AcquireWriteLockAndRefresh();
+
+        try
+        {
+            var sb = _sbManager.Active;
+            if (dirty)
+                sb.Flags |= Superblock.FlagDirtyOpen;
+            else
+                sb.Flags &= ~Superblock.FlagDirtyOpen;
+
+            if (sb.Flags == _sbManager.Active.Flags)
+                return;
+
+            _sbManager.Commit(sb);
+            _lastKnownGeneration = _sbManager.Active.Generation;
+        }
+        finally
+        {
+            if (releaseLock)
+                ReleaseWriteLockIfHeld();
+        }
     }
 
     /// <summary>Returns true if the store was opened with the dirty flag set.</summary>
@@ -1296,7 +1302,7 @@ public sealed class ObjectEngine : IDisposable
         _idCache.Remove(id);
     }
 
-    private void IdCacheClear()
+    internal void IdCacheClear()
     {
         _idCache.Clear();
     }
