@@ -197,6 +197,7 @@ public sealed class BTree
             // Root collapsed — free the old root block
             if (_batchOwnedBlocks != null && _batchOwnedBlocks.ContainsKey(RootAddress))
                 _batchOwnedBlocks.Remove(RootAddress);
+            _dirtyNodes?.Remove(RootAddress);
             FreedBlocks.Add(RootAddress);
             RootAddress = rootNode.Children[0];
         }
@@ -204,6 +205,7 @@ public sealed class BTree
         {
             if (_batchOwnedBlocks != null && _batchOwnedBlocks.ContainsKey(RootAddress))
                 _batchOwnedBlocks.Remove(RootAddress);
+            _dirtyNodes?.Remove(RootAddress);
             FreedBlocks.Add(RootAddress);
             RootAddress = 0;
         }
@@ -647,6 +649,7 @@ public sealed class BTree
         long rightAddr = parent.Children[leftIdx + 1];
         if (_batchOwnedBlocks != null && _batchOwnedBlocks.ContainsKey(rightAddr))
             _batchOwnedBlocks.Remove(rightAddr);
+        _dirtyNodes?.Remove(rightAddr);
         FreedBlocks.Add(rightAddr);
         parent.Children.RemoveAt(leftIdx + 1);
         // Left child is rewritten (reuse if batch-owned)

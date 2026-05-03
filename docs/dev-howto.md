@@ -73,6 +73,8 @@ cl /O2 bench_objstore.c /Fe:bench_objstore.exe
 cl /O2 /DSQLITE_THREADSAFE=0 /DSQLITE_OMIT_LOAD_EXTENSION bench_sqlite.c sqlite3.c /Fe:bench_sqlite.exe
 ```
 
+bench_objstore should be compared to bench_sqlite to evaluate ObjectStore performance against SQLite on the same workload.
+
 ### Run
 
 ```powershell
@@ -128,3 +130,7 @@ dotnet test tests/ObjectStore.Tests --no-build -v q
 # Filter by name
 dotnet test tests/ObjectStore.Tests --filter "FullyQualifiedName~Transaction"
 ```
+
+## 5. Important notes
+
+Drive C: is an SSD, D: is an HDD. Using both allows testing performance differences between storage types.
