@@ -24,4 +24,10 @@ public sealed class ObjectStoreOptions
     /// Adds ~1μs per read for the generation check. Default: false.
     /// </summary>
     public bool MultiProcessMode { get; set; }
+
+    /// <summary>
+    /// Controls when block checksum validation is performed during reads.
+    /// Default: Always (validate on every disk read, safest).
+    /// </summary>
+    public ChecksumPolicy ChecksumPolicy { get; set; } = ChecksumPolicy.Always;
 }

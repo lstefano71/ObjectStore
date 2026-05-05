@@ -7,6 +7,31 @@ namespace ObjectStore.Native;
 /// </summary>
 public static partial class NativeExports
 {
+    /// <summary>Applies all relevant NativeOptions to an opened engine.</summary>
+    private static void ApplyNativeOptions(ObjectEngine engine, NativeOptions? opts)
+    {
+        if (opts == null) return;
+
+        if (opts.MultiProcessMode)
+            engine.MultiProcessMode = true;
+
+        if (opts.CacheMaxBytes > 0)
+        {
+            int blockCapacity = (int)(opts.CacheMaxBytes / FormatConstants.MinBlockSize);
+            engine.File.SetCacheCapacity(Math.Max(16, blockCapacity));
+        }
+        else if (opts.CacheMaxBytes == 0)
+        {
+            engine.File.SetCacheCapacity(0);
+        }
+
+        if (opts.LockTimeoutMs > 0)
+            engine.LockTimeout = TimeSpan.FromMilliseconds(opts.LockTimeoutMs);
+
+        if (opts.ChecksumPolicy >= 0 && opts.ChecksumPolicy <= 3)
+            engine.File.ChecksumPolicy = (ChecksumPolicy)opts.ChecksumPolicy;
+    }
+
     [UnmanagedCallersOnly(EntryPoint = "objstore_create")]
     public static unsafe int StoreCreate(byte* pathUtf8, IntPtr options, IntPtr* outHandle)
     {
@@ -22,8 +47,7 @@ public static partial class NativeExports
                 return NativeErrorCodes.InvalidArg; // Cannot create in read-only mode
 
             var engine = ObjectEngine.Create(path);
-            if (opts?.MultiProcessMode == true)
-                engine.MultiProcessMode = true;
+            ApplyNativeOptions(engine, opts);
             *outHandle = HandleStore.Allocate(engine);
             NativeErrorHelper.ClearLastError();
             return NativeErrorCodes.Ok;
@@ -51,8 +75,7 @@ public static partial class NativeExports
             else
                 engine = ObjectEngine.Open(path);
 
-            if (opts?.MultiProcessMode == true)
-                engine.MultiProcessMode = true;
+            ApplyNativeOptions(engine, opts);
             *outHandle = HandleStore.Allocate(engine);
             NativeErrorHelper.ClearLastError();
             return NativeErrorCodes.Ok;
@@ -86,8 +109,7 @@ public static partial class NativeExports
                 engine = ObjectEngine.OpenOrCreate(path);
             }
 
-            if (opts?.MultiProcessMode == true)
-                engine.MultiProcessMode = true;
+            ApplyNativeOptions(engine, opts);
             *outHandle = HandleStore.Allocate(engine);
             NativeErrorHelper.ClearLastError();
             return NativeErrorCodes.Ok;

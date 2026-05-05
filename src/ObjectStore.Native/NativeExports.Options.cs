@@ -155,6 +155,24 @@ public static partial class NativeExports
         }
     }
 
+    [UnmanagedCallersOnly(EntryPoint = "objstore_options_set_checksum_policy")]
+    public static int OptionsSetChecksumPolicy(IntPtr opts, int policy)
+    {
+        try
+        {
+            var o = HandleStore.Get<NativeOptions>(opts);
+            if (o == null) return NativeErrorCodes.InvalidArg;
+            if (policy < 0 || policy > 3) return NativeErrorCodes.InvalidArg;
+            o.ChecksumPolicy = policy;
+            NativeErrorHelper.ClearLastError();
+            return NativeErrorCodes.Ok;
+        }
+        catch (Exception ex)
+        {
+            return NativeErrorHelper.Capture(ex);
+        }
+    }
+
     [UnmanagedCallersOnly(EntryPoint = "objstore_options_free")]
     public static void OptionsFree(IntPtr opts)
     {

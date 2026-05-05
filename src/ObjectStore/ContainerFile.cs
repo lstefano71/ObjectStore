@@ -9,6 +9,8 @@ public sealed class ContainerFile : IDisposable
     private readonly FileStream _stream;
     private long _fileSize;
     private SieveCache<long, byte[]>? _blockCache;
+    private ChecksumPolicy _checksumPolicy = ChecksumPolicy.Always;
+    private HashSet<long>? _validatedAddresses; // for OnFirstRead policy
 
     // Growth policy: double up to 256 MB, then grow by 64 MB increments
     private const long DoubleThreshold = 256 * 1024 * 1024;
@@ -25,6 +27,20 @@ public sealed class ContainerFile : IDisposable
     public string Path { get; }
     public SieveCache<long, byte[]>? BlockCache => _blockCache;
     public bool IsBufferingWrites => _pendingWrites != null;
+
+    /// <summary>Gets or sets the checksum validation policy for block reads.</summary>
+    public ChecksumPolicy ChecksumPolicy
+    {
+        get => _checksumPolicy;
+        set
+        {
+            _checksumPolicy = value;
+            if (value == ChecksumPolicy.OnFirstRead)
+                _validatedAddresses ??= new HashSet<long>();
+            else
+                _validatedAddresses = null;
+        }
+    }
 
     private ContainerFile(FileStream stream, string path)
     {
@@ -89,11 +105,12 @@ public sealed class ContainerFile : IDisposable
 
     /// <summary>
     /// Reads a block at the given address. Uses cache if available.
-    /// Validates the block header checksum. Returns the payload (without header).
+    /// Validates the block header checksum unless skipped by policy or caller.
+    /// Returns the payload (without header).
     /// WARNING: The returned array may be shared with the cache — do NOT mutate it.
     /// Use ReadBlockMutable if you need to modify the data.
     /// </summary>
-    public byte[] ReadBlock(long address, int order)
+    public byte[] ReadBlock(long address, int order, bool skipChecksumValidation = false)
     {
         if (_blockCache != null && _blockCache.TryGet(address, out var cached))
             return cached!;
@@ -103,10 +120,13 @@ public sealed class ContainerFile : IDisposable
         try
         {
             ReadRaw(address, raw.AsSpan(0, blockSize));
-            int payloadSize = BlockHeader.Validate(raw.AsSpan(0, blockSize));
+            int payloadSize = ShouldValidate(address, skipChecksumValidation)
+                ? BlockHeader.Validate(raw.AsSpan(0, blockSize))
+                : BlockHeader.ReadPayloadSizeOnly(raw.AsSpan(0, blockSize));
             byte[] payload = new byte[payloadSize];
             raw.AsSpan(FormatConstants.BlockHeaderSize, payloadSize).CopyTo(payload);
 
+            MarkValidated(address);
             _blockCache?.Put(address, payload);
             return payload;
         }
@@ -157,10 +177,13 @@ public sealed class ContainerFile : IDisposable
         try
         {
             ReadRaw(address, raw.AsSpan(0, blockSize));
-            int payloadSize = BlockHeader.Validate(raw.AsSpan(0, blockSize));
+            int payloadSize = ShouldValidate(address, false)
+                ? BlockHeader.Validate(raw.AsSpan(0, blockSize))
+                : BlockHeader.ReadPayloadSizeOnly(raw.AsSpan(0, blockSize));
             byte[] payload = new byte[payloadSize];
             raw.AsSpan(FormatConstants.BlockHeaderSize, payloadSize).CopyTo(payload);
 
+            MarkValidated(address);
             _blockCache?.Put(address, payload);
             return (payload, order);
         }
@@ -197,10 +220,13 @@ public sealed class ContainerFile : IDisposable
         try
         {
             ReadRaw(address, raw.AsSpan(0, blockSize));
-            int payloadSize = BlockHeader.Validate(raw.AsSpan(0, blockSize));
+            int payloadSize = ShouldValidate(address, false)
+                ? BlockHeader.Validate(raw.AsSpan(0, blockSize))
+                : BlockHeader.ReadPayloadSizeOnly(raw.AsSpan(0, blockSize));
             byte[] payload = new byte[payloadSize];
             raw.AsSpan(FormatConstants.BlockHeaderSize, payloadSize).CopyTo(payload);
 
+            MarkValidated(address);
             _blockCache?.Put(address, payload);
             return payload;
         }
@@ -402,5 +428,40 @@ public sealed class ContainerFile : IDisposable
 
         _stream.SetLength(newSize);
         _fileSize = newSize;
+    }
+
+    // ---- Checksum policy helpers ----
+
+    /// <summary>
+    /// Determines whether a block read should perform checksum validation.
+    /// </summary>
+    private bool ShouldValidate(long address, bool callerSkip)
+    {
+        if (callerSkip) return false; // MetadataOnly: caller explicitly skips data blocks
+
+        switch (_checksumPolicy)
+        {
+            case ChecksumPolicy.None:
+                return false;
+            case ChecksumPolicy.OnFirstRead:
+                return _validatedAddresses != null && !_validatedAddresses.Contains(address);
+            default: // Always (and MetadataOnly for non-skipped blocks)
+                return true;
+        }
+    }
+
+    /// <summary>Records that a block has been validated (for OnFirstRead policy).</summary>
+    private void MarkValidated(long address)
+    {
+        _validatedAddresses?.Add(address);
+    }
+
+    /// <summary>
+    /// Clears the set of validated addresses. Called on Refresh() when another
+    /// process may have overwritten blocks.
+    /// </summary>
+    public void ClearValidatedAddresses()
+    {
+        _validatedAddresses?.Clear();
     }
 }

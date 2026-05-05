@@ -76,11 +76,18 @@ int objstore_options_set_cache_max_bytes(objstore_options_t opts, int64_t bytes)
 int objstore_options_set_lock_timeout_ms(objstore_options_t opts, int32_t ms);
 int objstore_options_set_encryption_key(objstore_options_t opts, const uint8_t* key, size_t key_len);
 int objstore_options_set_compression(objstore_options_t opts, int codec);
+int objstore_options_set_checksum_policy(objstore_options_t opts, int policy);
 
 /** Compression codecs for objstore_options_set_compression. */
 #define OBJSTORE_COMPRESS_NONE    0
 #define OBJSTORE_COMPRESS_DEFLATE 1
 #define OBJSTORE_COMPRESS_BROTLI  2
+
+/** Checksum validation policies for objstore_options_set_checksum_policy. */
+#define OBJSTORE_CHECKSUM_ALWAYS      0
+#define OBJSTORE_CHECKSUM_METADATA    1
+#define OBJSTORE_CHECKSUM_FIRST_READ  2
+#define OBJSTORE_CHECKSUM_NONE        3
 
 /* ============================================================
  * Store Lifecycle

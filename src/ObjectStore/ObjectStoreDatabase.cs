@@ -50,6 +50,7 @@ public sealed class ObjectStoreDatabase : IDisposable
             engine.File.SetCacheCapacity(Math.Max(16, blockCapacity));
         }
         engine.MultiProcessMode = options.MultiProcessMode;
+        engine.File.ChecksumPolicy = options.ChecksumPolicy;
     }
 
     // --- Object Operations ---

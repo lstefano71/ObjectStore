@@ -75,22 +75,34 @@ cl /O2 /DSQLITE_THREADSAFE=0 /DSQLITE_OMIT_LOAD_EXTENSION bench_sqlite.c sqlite3
 
 bench_objstore should be compared to bench_sqlite to evaluate ObjectStore performance against SQLite on the same workload.
 
+### Mixed workload benchmarks (bench2)
+
+```cmd
+cl /O2 bench2_objstore.c /Fe:bench2_objstore.exe
+cl /O2 /DSQLITE_THREADSAFE=0 /DSQLITE_OMIT_LOAD_EXTENSION bench2_sqlite.c sqlite3.c /Fe:bench2_sqlite.exe
+```
+
+bench2 tests a more realistic workload: seed 100K objects (256B–16KB), 50K random reads with content verification, and a mixed phase with writes every 100 reads. ObjectStore uses `MetadataOnly` checksum policy for a fair comparison with SQLite (which does no per-blob checksum on reads).
+
 ### Run
 
 ```powershell
 cd tests/c_bench
 
-# ObjectStore benchmark (args: DLL path, output directory)
+# Original sequential benchmarks
 .\bench_objstore.exe "..\..\publish_native\ObjectStore.Native.dll" "C:\temp"
-
-# SQLite benchmark (arg: output directory)
 .\bench_sqlite.exe "C:\temp"
+
+# Mixed workload benchmarks
+.\bench2_objstore.exe "..\..\publish_native\ObjectStore.Native.dll" "C:\temp"
+.\bench2_sqlite.exe "C:\temp"
 ```
 
 **Notes:**
 - Use `C:\temp` (SSD) for consistent results. `D:\temp` is HDD.
 - ObjectStore runs in MultiProcessMode (AutoRefresh) by default.
-- Both benchmarks test: Sequential Write 256B/64KB, Sequential Read 256B/64KB, Txn Batch 256B/64KB.
+- bench_objstore/bench_sqlite test: Sequential Write 256B/64KB, Sequential Read 256B/64KB, Txn Batch 256B/64KB.
+- bench2_objstore/bench2_sqlite test: Seed 100K, Random Read 50K, Mixed R+W 50K.
 
 ---
 
@@ -121,7 +133,7 @@ dotnet run -c Release -- --filter "*BatchInsert*"
 ## 4. Unit Tests (C# / xUnit)
 
 ```powershell
-# Run all 251 unit tests
+# Run all unit tests
 dotnet test tests/ObjectStore.Tests
 
 # Quick (no rebuild)
@@ -131,6 +143,41 @@ dotnet test tests/ObjectStore.Tests --no-build -v q
 dotnet test tests/ObjectStore.Tests --filter "FullyQualifiedName~Transaction"
 ```
 
-## 5. Important notes
+---
+
+## 5. Checksum Policy (Performance Tuning)
+
+ObjectStore validates block checksums (xxHash3) on every disk read by default. For read-heavy workloads this can dominate CPU time. A configurable `ChecksumPolicy` controls validation behavior:
+
+| Policy | Behavior |
+|--------|----------|
+| `Always` (default) | Validate checksum on every disk read. Safest. |
+| `MetadataOnly` | Validate B-tree/metadata blocks. Skip checksum for object data blocks. |
+| `OnFirstRead` | Validate on first disk read; skip on subsequent reads of the same block address. |
+| `None` | Never validate. Fastest, least safe. |
+
+### C# API
+
+```csharp
+var options = new ObjectStoreOptions { ChecksumPolicy = ChecksumPolicy.MetadataOnly };
+using var db = ObjectStoreDatabase.Open("store.dat", options);
+```
+
+### C API (via NativeAOT DLL)
+
+```c
+#define OBJSTORE_CHECKSUM_ALWAYS      0
+#define OBJSTORE_CHECKSUM_METADATA    1
+#define OBJSTORE_CHECKSUM_FIRST_READ  2
+#define OBJSTORE_CHECKSUM_NONE        3
+
+objstore_options_set_checksum_policy(opts, OBJSTORE_CHECKSUM_METADATA);
+```
+
+**Recommendation:** Use `MetadataOnly` for benchmarks and read-heavy production workloads where data integrity is ensured at write time. Use `Always` when reading untrusted or shared stores.
+
+---
+
+## 6. Important notes
 
 Drive C: is an SSD, D: is an HDD. Using both allows testing performance differences between storage types.

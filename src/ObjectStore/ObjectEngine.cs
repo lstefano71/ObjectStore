@@ -32,6 +32,15 @@ public sealed class ObjectEngine : IDisposable
     /// </summary>
     public bool MultiProcessMode { get; set; }
 
+    /// <summary>
+    /// Timeout for acquiring the cross-process write lock. Default: 30 seconds.
+    /// </summary>
+    public TimeSpan LockTimeout
+    {
+        get => _lockTimeout;
+        set => _lockTimeout = value;
+    }
+
     public ContainerFile File => _file;
     public BuddyAllocator Allocator => _allocator;
     public BTree Tree => _tree;
@@ -178,6 +187,7 @@ public sealed class ObjectEngine : IDisposable
             return;
 
         _file.BlockCache?.Clear();
+        _file.ClearValidatedAddresses();
         IdCacheClear();
 
         if (active.BuddyRootAddress != 0)
@@ -438,6 +448,7 @@ public sealed class ObjectEngine : IDisposable
         var extents = LoadExtentList(record);
         int bytesRead = 0;
         long currentOffset = 0;
+        bool skipDataChecksum = _file.ChecksumPolicy == ChecksumPolicy.MetadataOnly;
 
         foreach (var (addr, order) in extents.Extents)
         {
@@ -454,7 +465,7 @@ public sealed class ObjectEngine : IDisposable
 
                 if (toRead > 0)
                 {
-                    byte[] blockData = _file.ReadBlock(addr, order);
+                    byte[] blockData = _file.ReadBlock(addr, order, skipChecksumValidation: skipDataChecksum);
                     blockData.AsSpan(skipInExtent, toRead).CopyTo(buffer[startInBuffer..]);
                     bytesRead += toRead;
                 }

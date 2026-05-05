@@ -64,6 +64,7 @@ typedef void* objstore_options_t;
 typedef int (*fn_options_create)(objstore_options_t*);
 typedef int (*fn_options_free)(objstore_options_t);
 typedef int (*fn_options_set_multi_process)(objstore_options_t, int);
+typedef int (*fn_options_set_checksum_policy)(objstore_options_t, int);
 typedef int (*fn_open_or_create)(const char*, objstore_options_t, objstore_t*);
 typedef int (*fn_close)(objstore_t);
 typedef int (*fn_object_create)(objstore_t, const char*, uint64_t*);
@@ -74,10 +75,17 @@ typedef int (*fn_txn_commit)(objstore_t);
 typedef int (*fn_object_get_size)(objstore_t, uint64_t, int64_t*);
 typedef int (*fn_refresh)(objstore_t);
 
+/* Checksum policy constants */
+#define OBJSTORE_CHECKSUM_ALWAYS      0
+#define OBJSTORE_CHECKSUM_METADATA    1
+#define OBJSTORE_CHECKSUM_FIRST_READ  2
+#define OBJSTORE_CHECKSUM_NONE        3
+
 /* ---- Globals ---- */
 static fn_options_create    p_options_create;
 static fn_options_free      p_options_free;
 static fn_options_set_multi_process p_options_set_multi_process;
+static fn_options_set_checksum_policy p_options_set_checksum_policy;
 static fn_open_or_create    p_open_or_create;
 static fn_close             p_close;
 static fn_object_create     p_object_create;
@@ -108,6 +116,7 @@ static int load_dll(const char* dll_path) {
     LOAD(options_create);
     LOAD(options_free);
     LOAD(options_set_multi_process);
+    LOAD(options_set_checksum_policy);
     LOAD(open_or_create);
     LOAD(close);
     LOAD(object_create);
@@ -150,6 +159,7 @@ int main(int argc, char* argv[]) {
     printf("=== ObjectStore Mixed Workload Benchmark ===\n");
     printf("DLL: %s\n", dll_path);
     printf("Directory: %s\n", db_dir);
+    printf("Checksum policy: MetadataOnly (fair comparison with SQLite)\n");
     printf("Seed: %u objects (%d B – %d B), Reads: %d, Mixed: %d reads + writes every %d\n\n",
            SEED_COUNT, MIN_SIZE, MAX_SIZE, READ_COUNT, MIXED_READS, WRITE_INTERVAL);
 
@@ -162,6 +172,7 @@ int main(int argc, char* argv[]) {
     objstore_t store;
     p_options_create(&opts);
     p_options_set_multi_process(opts, 1);
+    p_options_set_checksum_policy(opts, OBJSTORE_CHECKSUM_METADATA);
     int rc = p_open_or_create(db_path, opts, &store);
     if (rc != 0) { fprintf(stderr, "open failed: %d\n", rc); return 1; }
     p_options_free(opts);

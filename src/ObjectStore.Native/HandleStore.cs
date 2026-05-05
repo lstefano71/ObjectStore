@@ -40,4 +40,5 @@ public sealed class NativeOptions
     public int LockTimeoutMs { get; set; } = 30_000;
     public byte[]? EncryptionKey { get; set; }
     public byte CompressionCodec { get; set; } // 0=None, 1=Deflate, 2=Brotli
+    public int ChecksumPolicy { get; set; } // 0=Always, 1=MetadataOnly, 2=OnFirstRead, 3=None
 }

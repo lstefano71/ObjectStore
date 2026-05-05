@@ -1,0 +1,16 @@
+{
+  "profiles": {
+    "ObjectStore.Benchmarks": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "BENCH_TMPDIR": "..\\c_bench\\run_tmp"
+      }
+    },
+    "bench2_objstore": {
+      "commandName": "Executable",
+      "executablePath": "..\\c_bench\\bench2_objstore.exe",
+      "workingDirectory": "..\\c_bench",
+      "commandLineArgs": "\"ObjectStore.Native.dll\" \"run_tmp\""
+    }
+  }
+}

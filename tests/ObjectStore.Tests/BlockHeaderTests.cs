@@ -30,9 +30,9 @@ public class BlockHeaderTests
         BlockHeader.WriteBlock(raw, payload, FormatConstants.BlockFlagInUse);
 
         BlockHeader.ValidateAndGetPayload(raw, out var result);
-        // Result is the full payload area
-        Assert.Equal(blockSize - FormatConstants.BlockHeaderSize, result.Length);
-        Assert.Equal(payload, result[..5]);
+        // Result is the actual payload
+        Assert.Equal(payload.Length, result.Length);
+        Assert.Equal(payload, result);
     }
 
     [Fact]
